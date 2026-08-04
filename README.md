@@ -49,6 +49,7 @@ This repository is a monorepo.
 | `get_status` | Gateway connection state | ✅ |
 | `get_device_info` | ESP32 device state (battery / volume / WiFi / etc.) | ✅ |
 | `take_photo(question?)` | Capture a frame, save as JPEG, return the path | ✅ |
+| `camera_stream(action, fps?, quality?)` | Reference-count an in-memory latest-JPEG stream (`start` / `stop` / `status`). No frame is written to disk. | ✅ |
 | `set_volume(volume)` | Speaker volume (0-100) | ✅ |
 | `set_brightness(brightness)` | Screen brightness (0-100) | ✅ |
 | `move_head(yaw, pitch, speed?)` | Move the neck (servos). `pitch` is constrained to `5..85` — the M5Stack-recommended operating range. For the wider firmware hard clamp (`0..88`), use the firmware-side `set_head_angles` device tool instead. | ✅ |
@@ -191,7 +192,8 @@ The firmware reads these NVS keys for the gateway connection:
   `websocket.url` cannot be reached or does not complete the server hello flow
 - `websocket.token` — the bearer token sent as `Authorization: Bearer <token>`,
   matched against `STACKCHAN_TOKEN` / `BEARER_TOKEN` on the gateway side
-  (leave both empty to skip authentication entirely)
+  (token-free operation is allowed only when the gateway binds to loopback;
+  non-loopback WebSocket/UDP binds require one of these gateway tokens)
 
 There are four practical ways to provide them, plus one temporary source-level escape hatch:
 
@@ -202,8 +204,8 @@ There are four practical ways to provide them, plus one temporary source-level e
    - `Fallback WebSocket gateway URL` →
      `CONFIG_DEFAULT_WEBSOCKET_FALLBACK_URL`
    - `Default WebSocket auth token (fallback when NVS is empty)` →
-     `CONFIG_DEFAULT_WEBSOCKET_TOKEN` (leave empty if your gateway accepts
-     unauthenticated connections)
+     `CONFIG_DEFAULT_WEBSOCKET_TOKEN` (leave empty only for a loopback-bound
+     gateway; non-loopback gateways require a token)
 
    By default these only apply when the corresponding NVS key is empty.
    For first-time flashes onto a fresh device this is exactly what you want.
@@ -228,10 +230,10 @@ There are four practical ways to provide them, plus one temporary source-level e
      build-time `CONFIG_DEFAULT_WEBSOCKET_TOKEN`. On stock builds where
      no Kconfig default is set this disables auth; on builds that ship
      a default token, ❌ reverts to that default rather than truly
-     clearing authentication. To switch the device to an unauthenticated
-     gateway on a build that ships a default token, rebuild the
-     firmware with the Kconfig default empty (or set a non-empty token
-     on the gateway side that matches the build default).
+     clearing authentication. Token-free operation is limited to a
+     loopback-bound gateway. On a build that ships a default token, rebuild
+     with that default empty for loopback development, or configure the
+     non-loopback gateway with a matching non-empty token.
 
    Submit to persist the values to the `websocket` NVS namespace
    (`websocket.url` / `websocket.fallback_url` / `websocket.token`); they
@@ -366,8 +368,10 @@ gateway configurations that tear the WebSocket session down after the handshake
 — so the device recovers automatically once the gateway accepts the next
 connection attempt.
 
-For non-LAN setups, see [`docs/remote-access.md`](docs/remote-access.md) for the
-Tailscale Funnel flow and the `VISION_URL` capture callback setting.
+For non-LAN setups, see [`docs/remote-access.md`](docs/remote-access.md).
+Camera-enabled firmware requires protected direct UDP reachability to the
+gateway as well as the WebSocket path; TCP-only Tailscale Funnel is not
+supported, and the UDP listener must not be exposed to the public internet.
 
 ### 3. Register as an MCP client (Claude Code example)
 

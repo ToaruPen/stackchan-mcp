@@ -10,6 +10,7 @@ import pytest
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from mcp.types import ErrorData, TextContent
 
+from stackchan_mcp.camera_stream import CameraFrame, LatestCameraFrameStore
 from stackchan_mcp.http_server import (
     AUTH_FAILURE_MESSAGE,
     BYPASS_TOOLS,
@@ -27,6 +28,9 @@ class FakeESP32:
     def __init__(self, *, connected: bool = True) -> None:
         self.device_connected = connected
         self.calls: list[tuple[str, dict]] = []
+        self.camera_frames = LatestCameraFrameStore()
+        self.camera_stream = FakeCameraStream()
+        self.head_target_lane = FakeHeadTargetLane()
 
     def get_status(self) -> dict:
         return {
@@ -44,6 +48,58 @@ class FakeESP32:
                 }
             ],
         }, None
+
+
+class FakeCameraStream:
+    def __init__(self) -> None:
+        self.touches = 0
+
+    def touch(self) -> None:
+        self.touches += 1
+
+
+class FakeHeadTargetLane:
+    def __init__(self) -> None:
+        self.lease_id = "lease-http"
+        self.accepted = 0
+
+    async def start(self, **_config) -> dict:
+        return {"phase": "running", "lease_id": self.lease_id}
+
+    async def update(
+        self,
+        lease_id: str,
+        sequence: int,
+        yaw: int,
+        pitch: int,
+    ) -> dict:
+        assert lease_id == self.lease_id
+        assert isinstance(sequence, int)
+        assert isinstance(yaw, int)
+        assert isinstance(pitch, int)
+        self.accepted += 1
+        await asyncio.sleep(0)
+        return {
+            "phase": "running",
+            "accepted": True,
+            "accepted_count": self.accepted,
+            "pending_depth": 1,
+        }
+
+    async def clear(self, lease_id: str) -> dict:
+        assert lease_id == self.lease_id
+        return {"phase": "running", "pending_depth": 0}
+
+    def status(self, lease_id: str | None = None) -> dict:
+        return {
+            "phase": "running",
+            "lease_id_match": lease_id in {None, self.lease_id},
+            "accepted": self.accepted,
+        }
+
+    async def stop(self, lease_id: str | None = None) -> dict:
+        assert lease_id in {None, self.lease_id}
+        return {"phase": "stopped", "accepted": self.accepted}
 
 
 class FakeGateway:
@@ -462,12 +518,21 @@ async def test_response_correlation_for_two_concurrent_clients() -> None:
 
 def test_bypass_tools_include_status_and_follow_pose_stream() -> None:
     assert "get_status" in BYPASS_TOOLS
+    assert "camera_stream" in BYPASS_TOOLS
     assert "stackchan_follow_pose_stream" in BYPASS_TOOLS
+    assert "stackchan_head_target_lane" in BYPASS_TOOLS
 
 
 @pytest.mark.asyncio
 async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
-    assert BYPASS_TOOLS == frozenset({"get_status", "stackchan_follow_pose_stream"})
+    assert BYPASS_TOOLS == frozenset(
+        {
+            "get_status",
+            "camera_stream",
+            "stackchan_follow_pose_stream",
+            "stackchan_head_target_lane",
+        }
+    )
     queue = CommandQueue(capacity=2)
 
     async def dispatch(_item: QueueItem):
@@ -489,6 +554,75 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
     payload = response.json()
     status = json.loads(payload["result"]["content"][0]["text"])
     assert status["connected"] is True
+    assert queue.depth == 0
+
+
+@pytest.mark.asyncio
+async def test_head_target_lane_updates_and_status_bypass_dispatcher() -> None:
+    queue = CommandQueue(capacity=2)
+
+    async def dispatch(_item: QueueItem):
+        raise AssertionError("head target lane must bypass the command queue")
+
+    gateway = FakeGateway()
+    app = build_app(
+        queue,
+        gateway=gateway,
+        owner_id="owner-test",
+        host="127.0.0.1",
+        port=8767,
+        dispatch_fn=dispatch,
+    )
+
+    async with _client(app) as client:
+        session_id = await _initialize(client)
+        started = await _call_tool(
+            client,
+            session_id=session_id,
+            name="stackchan_head_target_lane",
+            arguments={
+                "action": "start",
+                "rate_hz": 10,
+                "max_step_deg": 4,
+                "max_pending_age_ms": 180,
+                "speed_dps": 90,
+            },
+        )
+        updates = await asyncio.gather(
+            *(
+                _call_tool(
+                    client,
+                    session_id=session_id,
+                    name="stackchan_head_target_lane",
+                    arguments={
+                        "action": "update",
+                        "lease_id": "lease-http",
+                        "sequence": sequence,
+                        "yaw": 4,
+                        "pitch": 33,
+                    },
+                    request_id=f"update-{sequence}",
+                )
+                for sequence in range(1, 101)
+            )
+        )
+        status = await asyncio.wait_for(
+            _call_tool(
+                client,
+                session_id=session_id,
+                name="stackchan_head_target_lane",
+                arguments={"action": "status", "lease_id": "lease-http"},
+                request_id="status",
+            ),
+            timeout=0.1,
+        )
+
+    assert json.loads(
+        started.json()["result"]["content"][0]["text"]
+    )["lease_id"] == "lease-http"
+    assert all(response.status_code == 200 for response in updates)
+    status_payload = json.loads(status.json()["result"]["content"][0]["text"])
+    assert status_payload["accepted"] == 100
     assert queue.depth == 0
 
 
@@ -549,6 +683,91 @@ async def test_healthz_is_liveness_only_and_status_requires_auth_for_details() -
     assert status_payload["queue_capacity"] == 2
     assert status_payload["owner_id"] == "owner-test"
     assert status_payload["connected_clients"] == 0
+
+
+@pytest.mark.asyncio
+async def test_camera_latest_is_authenticated_and_returns_only_jpeg_bytes() -> None:
+    queue = CommandQueue(capacity=2)
+    gateway = FakeGateway()
+    jpeg = b"\xff\xd8latest-camera-frame\xff\xd9"
+    await gateway.esp32.camera_frames.publish(
+        CameraFrame(
+            sequence=42,
+            device_id="device-test",
+            captured_at_ms=1000,
+            encoded_at_ms=1010,
+            received_at_ms=1025,
+            width=320,
+            height=240,
+            quality=60,
+            jpeg=jpeg,
+        )
+    )
+    app = build_app(
+        queue,
+        gateway=gateway,
+        owner_id="owner-test",
+        host="127.0.0.1",
+        port=8767,
+        token="secret",
+    )
+
+    async with _client(app) as client:
+        unauthenticated = await client.get("/camera/latest")
+        latest = await client.get(
+            "/camera/latest",
+            headers=_headers(token="secret"),
+        )
+        no_newer_frame = await client.get(
+            "/camera/latest?after_sequence=42&timeout_ms=1",
+            headers=_headers(token="secret"),
+        )
+        status = await client.get(
+            "/camera/status",
+            headers=_headers(token="secret"),
+        )
+
+    assert unauthenticated.status_code == 401
+    assert latest.status_code == 200
+    assert latest.headers["content-type"] == "image/jpeg"
+    assert latest.headers["x-camera-sequence"] == "42"
+    assert latest.headers["x-camera-captured-at-ms"] == "1000"
+    assert latest.headers["x-camera-encoded-at-ms"] == "1010"
+    assert latest.headers["x-camera-received-at-ms"] == "1025"
+    assert latest.headers["cache-control"] == "no-store"
+    assert latest.content == jpeg
+    assert no_newer_frame.status_code == 204
+    assert no_newer_frame.content == b""
+    assert status.status_code == 200
+    assert status.json()["available"] is True
+    assert "jpeg" not in status.json()
+    assert "latest-camera-frame" not in json.dumps(status.json())
+    assert gateway.esp32.camera_stream.touches == 2
+
+
+@pytest.mark.asyncio
+async def test_camera_latest_rejects_invalid_long_poll_query() -> None:
+    app = build_app(
+        CommandQueue(capacity=2),
+        gateway=FakeGateway(),
+        owner_id="owner-test",
+        host="127.0.0.1",
+        port=8767,
+        token="secret",
+    )
+
+    async with _client(app) as client:
+        bad_sequence = await client.get(
+            "/camera/latest?after_sequence=-1",
+            headers=_headers(token="secret"),
+        )
+        bad_timeout = await client.get(
+            "/camera/latest?timeout_ms=30001",
+            headers=_headers(token="secret"),
+        )
+
+    assert bad_sequence.status_code == 400
+    assert bad_timeout.status_code == 400
 
 
 @pytest.mark.asyncio

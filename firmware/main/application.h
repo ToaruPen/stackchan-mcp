@@ -15,6 +15,9 @@
 #include "protocol.h"
 #include "ota.h"
 #include "audio_service.h"
+#if CONFIG_BOARD_TYPE_STACKCHAN
+#include "camera_stream_protocol.h"
+#endif
 #include "listening_profile.h"
 #include "device_state.h"
 #include "device_state_machine.h"
@@ -113,7 +116,19 @@ public:
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
+    // Main-task-only fast path for a tool reply whose callback was already
+    // marshalled by McpServer::DoToolCall. Other callers must use the
+    // thread-safe SendMcpMessage entry point above.
+    void SendMcpMessageFromMainTask(const std::string& payload);
     void SendStackChanEvent(const char* event_type, const char* subtype, uint64_t duration_ms);
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    void SendCameraJpeg(
+        const CameraStreamMetadata& metadata,
+        const uint8_t* jpeg,
+        size_t jpeg_size
+    );
+    void QuiesceCameraPackets();
+#endif
 
     // Phase 4.5 avatar: thread-safe generic WS text frame send.
     // Wraps Protocol::SendText through the main-task Schedule for the
@@ -138,6 +153,7 @@ private:
 
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
+    std::mutex protocol_mutex_;
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
@@ -151,6 +167,9 @@ private:
     std::string last_error_message_;
     AudioService audio_service_;
     std::unique_ptr<Ota> ota_;
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    CameraPacketSendLaneOwner camera_packet_send_lane_;
+#endif
 
     bool has_server_time_ = false;
     bool aborted_ = false;
@@ -174,6 +193,9 @@ private:
     bool IsListeningRequestCurrent(uint32_t generation) const;
     void ContinueOpenAudioChannel(ListeningMode mode, uint32_t generation);
     void ContinueWakeWordInvoke(const std::string& wake_word, uint32_t generation);
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    bool SendCameraPacket(const CameraStreamPacket& packet);
+#endif
 
     // Activation task (runs in background)
     void ActivationTask();

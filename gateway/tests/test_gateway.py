@@ -30,6 +30,7 @@ def _patch_gateway_network(monkeypatch: pytest.MonkeyPatch, gw: Gateway) -> list
             vision_token: str,
             audio_hook_url: str = "",
             audio_hook_token: str = "",
+            camera_datagram_host: str = "",
         ) -> None:
             self._server = object()
             calls.append(("esp32_start", host, port, vision_url, vision_token))
@@ -102,6 +103,17 @@ def test_vision_url_uses_lan_host(monkeypatch):
     gw = Gateway()
 
     assert gw.vision_url == "http://192.0.2.10:8766/capture"
+
+
+def test_camera_datagram_host_prefers_explicit_host_then_lan_host(monkeypatch):
+    monkeypatch.setenv("VISION_HOST", "192.0.2.10")
+    monkeypatch.setenv("STACKCHAN_CAMERA_DATAGRAM_HOST", "192.0.2.11")
+
+    gw = Gateway()
+
+    assert gw.camera_datagram_host == "192.0.2.11"
+    monkeypatch.delenv("STACKCHAN_CAMERA_DATAGRAM_HOST")
+    assert gw.camera_datagram_host == "192.0.2.10"
 
 
 def test_vision_token_prefers_explicit_token(monkeypatch):

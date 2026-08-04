@@ -11,6 +11,8 @@ public:
     ~PowerSaveTimer();
 
     void SetEnabled(bool enabled);
+    bool IsEnabled() const;
+    bool IsInSleepMode() const;
     void OnEnterSleepMode(std::function<void()> callback);
     void OnExitSleepMode(std::function<void()> callback);
     void OnShutdownRequest(std::function<void()> callback);

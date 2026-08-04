@@ -19,7 +19,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import CallToolRequest, CallToolResult, ErrorData, ServerResult, TextContent
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
@@ -29,11 +29,19 @@ from .stdio_server import _dispatch_mcp_tool, create_server
 
 # Follower lifecycle operations must remain callable when the ESP32 is
 # disconnected so HTTP clients can supervise the background task.
-BYPASS_TOOLS = frozenset({"get_status", "stackchan_follow_pose_stream"})
+BYPASS_TOOLS = frozenset(
+    {
+        "get_status",
+        "camera_stream",
+        "stackchan_follow_pose_stream",
+        "stackchan_head_target_lane",
+    }
+)
 MCP_HTTP_ALLOWED_HOSTS_ENV = "MCP_HTTP_ALLOWED_HOSTS"
 AUTH_FAILURE_MESSAGE = "Unauthorized: missing or invalid bearer token"
 HOST_FAILURE_MESSAGE = "Forbidden: invalid Host header"
 ORIGIN_FAILURE_MESSAGE = "Forbidden: invalid Origin header"
+CAMERA_HTTP_PATHS = frozenset({"/camera/latest", "/camera/status"})
 NON_LOOPBACK_TOKEN_REQUIRED_MESSAGE = (
     "stackchan-mcp: refusing non-loopback MCP_HTTP_HOST without "
     "STACKCHAN_TOKEN or BEARER_TOKEN"
@@ -136,6 +144,48 @@ def build_app(
         )
         return JSONResponse(status_payload)
 
+    async def camera_latest(request: Request) -> Response:
+        try:
+            after_sequence = _optional_query_integer(
+                request,
+                "after_sequence",
+                minimum=0,
+                maximum=(1 << 63) - 1,
+            )
+            timeout_ms = (
+                _optional_query_integer(
+                    request,
+                    "timeout_ms",
+                    minimum=0,
+                    maximum=30_000,
+                )
+                or 0
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        gateway.esp32.camera_stream.touch()
+        frame = await gateway.esp32.camera_frames.wait_for_frame(
+            after_sequence=after_sequence,
+            timeout_s=timeout_ms / 1000,
+        )
+        if frame is None:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        return Response(
+            content=frame.jpeg,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Camera-Sequence": str(frame.gateway_sequence),
+                "X-Camera-Captured-At-Ms": str(frame.captured_at_ms),
+                "X-Camera-Encoded-At-Ms": str(frame.encoded_at_ms),
+                "X-Camera-Received-At-Ms": str(frame.received_at_ms),
+            },
+        )
+
+    async def camera_status(_request: Request) -> JSONResponse:
+        return JSONResponse(gateway.esp32.camera_frames.status())
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
         dispatcher_task: asyncio.Task[None] | None = None
@@ -162,6 +212,8 @@ def build_app(
         ),
         Route("/healthz", endpoint=healthz, methods=["GET"]),
         Route("/status", endpoint=status, methods=["GET"]),
+        Route("/camera/latest", endpoint=camera_latest, methods=["GET"]),
+        Route("/camera/status", endpoint=camera_status, methods=["GET"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.command_queue = queue
@@ -372,7 +424,11 @@ class _GuardedASGIApp:
                 send,
             )
             return
-        if self._token and scope.get("path") in {"/mcp", "/status"}:
+        if self._token and scope.get("path") in {
+            "/mcp",
+            "/status",
+            *CAMERA_HTTP_PATHS,
+        }:
             expected = f"Bearer {self._token}"
             if request.headers.get("authorization") != expected:
                 await PlainTextResponse(
@@ -390,6 +446,27 @@ class _GuardedASGIApp:
     @property
     def router(self) -> Any:
         return self._app.router
+
+
+def _optional_query_integer(
+    request: Request,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    raw_value = request.query_params.get(name)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer in {minimum}..{maximum}"
+        ) from exc
+    if value < minimum or value > maximum or str(value) != raw_value:
+        raise ValueError(f"{name} must be an integer in {minimum}..{maximum}")
+    return value
 
 
 class _StreamableHTTPASGIApp:

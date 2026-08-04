@@ -447,9 +447,16 @@ private:
 
     void ReplyResult(int id, const std::string& result);
     void ReplyError(int id, const std::string& message);
+    void ReplyResultFromMainTask(int id, const std::string& result);
+    void ReplyErrorFromMainTask(int id, const std::string& message);
+    void ReplyResult(int id, const std::string& result, bool from_main_task);
+    void ReplyError(int id, const std::string& message, bool from_main_task);
 
     void GetToolsList(int id, const std::string& cursor, bool list_user_only_tools);
-    void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
+    void DoToolCall(
+        int id,
+        const std::string& tool_name,
+        const cJSON* tool_arguments);
 
     std::vector<McpTool*> tools_;
 };

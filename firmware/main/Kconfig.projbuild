@@ -1120,12 +1120,13 @@ config STACKCHAN_SERVO_DELEGATED_MOTION
 
 config STACKCHAN_AUTO_TORQUE_RELEASE_ENABLED
     bool "Auto release SCS0009 torque on motion idle"
-    default y
+    default n
     help
-        Releases servo torque after motion idle timeout to mitigate
-        SCS0009 cumulative WritePos protection mode (#165) and reduce
-        motor heat. Re-engages automatically on the next motion command
-        via explicit EnableTorque(ON) at the motion entry point.
+        Opt-in power and heat mitigation. Releasing torque makes the physical
+        pose externally movable while the controller retains only its last
+        commanded pose, so continuous tracking builds keep this disabled.
+        When enabled, torque re-engages automatically on the next motion
+        command via explicit EnableTorque(ON) at the motion entry point.
 
 config STACKCHAN_AUTO_TORQUE_RELEASE_MS
     int "Idle timeout before torque release (ms)"

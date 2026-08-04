@@ -47,6 +47,14 @@ void PowerSaveTimer::SetEnabled(bool enabled) {
     }
 }
 
+bool PowerSaveTimer::IsEnabled() const {
+    return enabled_;
+}
+
+bool PowerSaveTimer::IsInSleepMode() const {
+    return in_sleep_mode_;
+}
+
 void PowerSaveTimer::OnEnterSleepMode(std::function<void()> callback) {
     on_enter_sleep_mode_ = callback;
 }

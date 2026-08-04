@@ -82,6 +82,18 @@ class Gateway:
         )
 
     @property
+    def camera_datagram_host(self) -> str:
+        """Direct UDP host reachable from the device.
+
+        A TCP proxy may terminate the camera setup WebSocket locally, so its
+        public hostname and observed peer address aren't usable for UDP. The
+        existing LAN-facing VISION_HOST is the natural default in that setup.
+        """
+        return os.getenv("STACKCHAN_CAMERA_DATAGRAM_HOST") or os.getenv(
+            "VISION_HOST", ""
+        )
+
+    @property
     def audio_hook_url(self) -> str:
         """URL receiving device-driven listen captures as Ogg/Opus.
 
@@ -142,6 +154,7 @@ class Gateway:
             vision_token=self.vision_token,
             audio_hook_url=self.audio_hook_url,
             audio_hook_token=self.audio_hook_token,
+            camera_datagram_host=self.camera_datagram_host,
         )
 
         # Start HTTP capture server. Hosts /capture, /pcm, and the

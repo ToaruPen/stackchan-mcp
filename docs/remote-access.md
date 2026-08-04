@@ -1,17 +1,25 @@
-# Remote Access with Tailscale Funnel
+# Remote Access
 
 This guide explains how to make a `stackchan-mcp` gateway reachable when the
 StackChan device and gateway host are on different networks.
 
-The recommended first path is Tailscale Funnel:
+> [!IMPORTANT]
+> Current camera-enabled firmware requires both its control WebSocket and a
+> direct UDP route to the gateway. Tailscale Funnel forwards TCP/HTTPS but not
+> this UDP camera channel, so a TCP-only Funnel setup is unsupported. Do not
+> expose the UDP listener to the public internet. Put the ESP32 and gateway on
+> the same protected network, or provide a protected routed VPN path through a
+> router that the ESP32 can use.
 
-- no firmware feature work is required
+Funnel can still carry the control and photo-upload TCP paths when that
+protected UDP route already exists:
+
 - the ESP32 connects to a public `wss://...ts.net` gateway URL
 - the gateway still verifies the ESP32 bearer token with `STACKCHAN_TOKEN`
 - photo uploads can use a second Funnel URL through `VISION_URL` and are
   protected with `VISION_TOKEN` or, by default, `STACKCHAN_TOKEN`
 
-Tailscale Funnel publishes local services on a device in your tailnet to the
+Tailscale Funnel publishes local TCP services on a device in your tailnet to the
 public internet over HTTPS. It requires Tailscale CLI support, MagicDNS, HTTPS
 certificates, and a Funnel node attribute in the tailnet policy. Funnel can
 listen only on `443`, `8443`, or `10000`, so this guide uses `443` for the
@@ -36,6 +44,12 @@ Tailscale Funnel :443
     ▼
 stackchan-mcp gateway WebSocket :8765
 
+ESP32 camera stream
+    │
+    │ authenticated SCU1 datagrams over protected UDP
+    ▼
+stackchan-mcp gateway UDP :8765
+
 ESP32 camera upload
     │
     │ https://<node>.<tailnet>.ts.net:8443/capture
@@ -49,8 +63,10 @@ stackchan-mcp capture server :8766
 
 ## Security Notes
 
-Funnel makes the selected service public. Keep `STACKCHAN_TOKEN` set and use a
-strong token for the WebSocket gateway.
+Funnel makes the selected TCP service public. Keep `STACKCHAN_TOKEN` set and
+use a strong token for the WebSocket gateway. The camera UDP listener has its
+own per-session secret and source binding, but it must remain on a protected
+LAN or routed VPN and must not be forwarded from the public internet.
 
 The `/capture` endpoint is a separate HTTP upload endpoint. Keep
 `STACKCHAN_TOKEN` set so the gateway can pass a bearer token to the ESP32 for
@@ -64,8 +80,8 @@ files, captures, or local firmware override files.
 
 If you only need access from devices that already run Tailscale, use Tailscale
 Serve or a normal tailnet address instead of Funnel. The ESP32 firmware does
-not currently run a Tailscale client, so the StackChan device itself needs a
-public Funnel URL unless a separate network layer routes it into the tailnet.
+not currently run a Tailscale client, so a router must provide the protected
+route between the ESP32 network and the gateway tailnet for camera UDP.
 
 ## Gateway Configuration
 
@@ -77,6 +93,8 @@ STACKCHAN_TOKEN=<strong-shared-token>
 
 HOST=0.0.0.0
 WS_PORT=8765
+# Protected LAN or routed-VPN address reachable directly from the ESP32.
+STACKCHAN_CAMERA_DATAGRAM_HOST=<protected-gateway-address>
 CAPTURE_PORT=8766
 
 VISION_URL=https://<node>.<tailnet>.ts.net:8443/capture
@@ -90,6 +108,11 @@ upload bearer token; if it is empty, the gateway reuses `STACKCHAN_TOKEN`.
 `VISION_HOST` remains useful for LAN-only setups where the capture URL is
 `http://<lan-ip>:8766/capture`.
 
+`STACKCHAN_CAMERA_DATAGRAM_HOST` is advertised only for the camera UDP channel,
+which uses the same numeric port as `WS_PORT`. It must resolve or route to the
+gateway from the ESP32's protected network. A Funnel hostname is not valid for
+this setting because Funnel does not provide the required UDP route.
+
 Start the gateway:
 
 ```bash
@@ -97,9 +120,10 @@ cd gateway
 uv run python -m stackchan_mcp
 ```
 
-## Funnel Setup
+## Optional Funnel Setup for the TCP Paths
 
-On the same host as the gateway, enable two Funnel listeners.
+Use this section only after the protected camera UDP route works. On the same
+host as the gateway, enable two Funnel listeners for the TCP paths.
 
 Use port `443` for the WebSocket gateway:
 
@@ -168,17 +192,21 @@ For existing devices with stale NVS values, use the documented
 
 ## Validation
 
-After the gateway, Funnel, and device settings are in place:
+After the gateway, protected UDP route, optional Funnel, and device settings are
+in place:
 
 1. Start the gateway.
-2. Start both Funnel listeners.
-3. Reboot or reset the StackChan device.
-4. Press the StackChan main button to start a chat session. The firmware opens
+2. Verify that the ESP32 can reach `STACKCHAN_CAMERA_DATAGRAM_HOST:WS_PORT` over
+   the protected UDP route.
+3. If using Funnel for the TCP paths, start both Funnel listeners.
+4. Reboot or reset the StackChan device.
+5. Press the StackChan main button to start a chat session. The firmware opens
    the WebSocket connection when a session starts; an idle device may not appear
    in `get_status` immediately after boot.
-5. Call `get_status` from the MCP client and confirm `connected=true`.
-6. Call `get_device_info`.
-7. Call `take_photo` and confirm the capture reaches the gateway.
+6. Call `get_status` from the MCP client and confirm `connected=true`.
+7. Call `get_device_info`.
+8. Start `camera_stream` and confirm frames arrive over UDP.
+9. Call `take_photo` and confirm the capture reaches the gateway.
 
 If the device and gateway are on the same physical LAN during validation, this
 still verifies that the firmware uses the public Funnel `wss://` URL, bearer

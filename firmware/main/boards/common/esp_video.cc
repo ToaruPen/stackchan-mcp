@@ -6,6 +6,7 @@
 #include <sys/param.h>
 #include <unistd.h>
 #include <errno.h>
+#include <esp_timer.h>
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include "display.h"
 #include "esp_video.h"
 #include "esp_jpeg_common.h"
+#include "esp_jpeg_enc.h"
 #include "jpg/image_to_jpeg.h"
 #include "jpg/jpeg_to_image.h"
 #include "lvgl_display.h"
@@ -55,6 +57,119 @@
 
 
 #define TAG "EspVideo"
+
+class EspVideoStreamJpegEncoder {
+public:
+    static std::unique_ptr<EspVideoStreamJpegEncoder> Create(
+        uint16_t width,
+        uint16_t height,
+        v4l2_pix_fmt_t format,
+        uint8_t quality
+    ) {
+        if (format == V4L2_PIX_FMT_YUV422P) {
+            // esp_video 1.3.1 advertises YUV422P but supplies packed YUYV.
+            format = V4L2_PIX_FMT_YUYV;
+        }
+        if (format != V4L2_PIX_FMT_YUYV) {
+            ESP_LOGE(TAG, "Camera stream JPEG encoder does not support format 0x%08lx", format);
+            return nullptr;
+        }
+
+        jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
+        config.width = width;
+        config.height = height;
+        config.src_type = JPEG_PIXEL_FORMAT_YCbYCr;
+        config.subsampling = JPEG_SUBSAMPLE_420;
+        config.quality = quality;
+        config.rotate = JPEG_ROTATE_0D;
+        config.task_enable = false;
+
+        jpeg_enc_handle_t handle = nullptr;
+        const jpeg_error_t open_result = jpeg_enc_open(&config, &handle);
+        if (open_result != JPEG_ERR_OK || handle == nullptr) {
+            ESP_LOGE(TAG, "Camera stream jpeg_enc_open failed: %d", static_cast<int>(open_result));
+            return nullptr;
+        }
+
+        size_t output_capacity =
+            static_cast<size_t>(width) * static_cast<size_t>(height) * 3 / 2 +
+            64 * 1024;
+        output_capacity = MAX(output_capacity, static_cast<size_t>(128 * 1024));
+        auto* output = static_cast<uint8_t*>(
+            heap_caps_malloc(output_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+        if (output == nullptr) {
+            jpeg_enc_close(handle);
+            ESP_LOGE(TAG, "Camera stream JPEG output allocation failed");
+            return nullptr;
+        }
+
+        return std::unique_ptr<EspVideoStreamJpegEncoder>(
+            new EspVideoStreamJpegEncoder(
+                handle,
+                output,
+                output_capacity,
+                static_cast<size_t>(width) * static_cast<size_t>(height) * 2
+            )
+        );
+    }
+
+    ~EspVideoStreamJpegEncoder() {
+        if (handle_ != nullptr) {
+            jpeg_enc_close(handle_);
+        }
+        heap_caps_free(output_);
+    }
+
+    bool Encode(
+        const uint8_t* input,
+        size_t input_size,
+        const uint8_t** output,
+        size_t* output_size
+    ) {
+        if (input == nullptr || output == nullptr || output_size == nullptr ||
+            input_size < expected_input_size_ ||
+            (reinterpret_cast<uintptr_t>(input) & 0x0fU) != 0) {
+            return false;
+        }
+
+        int encoded_size = 0;
+        const jpeg_error_t result = jpeg_enc_process(
+            handle_,
+            input,
+            static_cast<int>(expected_input_size_),
+            output_,
+            static_cast<int>(output_capacity_),
+            &encoded_size
+        );
+        if (result != JPEG_ERR_OK || encoded_size <= 0) {
+            ESP_LOGE(TAG, "Camera stream jpeg_enc_process failed: %d", static_cast<int>(result));
+            return false;
+        }
+
+        *output = output_;
+        *output_size = static_cast<size_t>(encoded_size);
+        return true;
+    }
+
+private:
+    EspVideoStreamJpegEncoder(
+        jpeg_enc_handle_t handle,
+        uint8_t* output,
+        size_t output_capacity,
+        size_t expected_input_size
+    )
+        : handle_(handle),
+          output_(output),
+          output_capacity_(output_capacity),
+          expected_input_size_(expected_input_size) {
+    }
+
+    jpeg_enc_handle_t handle_;
+    uint8_t* output_;
+    size_t output_capacity_;
+    size_t expected_input_size_;
+};
 
 #if defined(CONFIG_CAMERA_SENSOR_SWAP_PIXEL_BYTE_ORDER) || defined(CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP)
 #warning \
@@ -276,7 +391,11 @@ EspVideo::EspVideo(const esp_video_init_config_t& config) {
 
     // 申请缓冲并mmap
     struct v4l2_requestbuffers req = {};
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    req.count = 2;
+#else
     req.count = strcmp(video_device_name, ESP_VIDEO_MIPI_CSI_DEVICE_NAME) == 0 ? 2 : 1;
+#endif
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (ioctl(video_fd_, VIDIOC_REQBUFS, &req) != 0) {
@@ -363,6 +482,10 @@ EspVideo::EspVideo(const esp_video_init_config_t& config) {
 }
 
 EspVideo::~EspVideo() {
+    StopStream();
+    if (camera_stream_thread_.joinable()) {
+        camera_stream_thread_.join();
+    }
     if (streaming_on_ && video_fd_ >= 0) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(video_fd_, VIDIOC_STREAMOFF, &type);
@@ -386,6 +509,11 @@ void EspVideo::SetExplainUrl(const std::string& url, const std::string& token) {
 }
 
 bool EspVideo::Capture() {
+    if (camera_stream_running_.load()) {
+        ESP_LOGW(TAG, "Single photo capture is unavailable while camera stream is running");
+        return false;
+    }
+    std::lock_guard<std::mutex> capture_lock(capture_mutex_);
     if (encoder_thread_.joinable()) {
         encoder_thread_.join();
     }
@@ -872,6 +1000,200 @@ bool EspVideo::SetVFlip(bool enabled) {
         return false;
     }
     return true;
+}
+
+bool EspVideo::StartStream(int fps, int quality, StreamFrameSink sink) {
+    if (fps < 1 || fps > 20 || quality < 1 || quality > 100 || !sink ||
+        !streaming_on_.load() || video_fd_ < 0) {
+        return false;
+    }
+    if (camera_stream_running_.load()) {
+        return camera_stream_fps_.load() == fps &&
+               camera_stream_quality_.load() == quality;
+    }
+    if (camera_stream_thread_.joinable()) {
+        ESP_LOGW(TAG, "Camera stream start rejected before prior stop completed");
+        return false;
+    }
+
+    camera_stream_encoder_ = EspVideoStreamJpegEncoder::Create(
+        frame_.width,
+        frame_.height,
+        sensor_format_,
+        static_cast<uint8_t>(quality)
+    );
+    if (camera_stream_encoder_ == nullptr) {
+        return false;
+    }
+    camera_stream_sink_ = std::move(sink);
+    camera_stream_fps_.store(fps);
+    camera_stream_quality_.store(quality);
+    camera_stream_credits_.store(0);
+    camera_stream_sequence_.store(0);
+    camera_stream_frames_.store(0);
+    camera_stream_encode_failures_.store(0);
+    camera_stream_stage_.store(CameraStreamWorkerStage::kWaiting);
+    camera_stream_running_.store(true);
+    camera_stream_thread_ = std::thread([this]() { CameraStreamLoop(); });
+    ESP_LOGI(TAG, "Camera stream started at %d fps, quality %d", fps, quality);
+    return true;
+}
+
+void EspVideo::StopStream() {
+    camera_stream_running_.store(false);
+    camera_stream_credits_.store(0);
+    ESP_LOGI(
+        TAG,
+        "Camera stream stop requested at worker stage %s",
+        CameraStreamWorkerStageName(camera_stream_stage_.load())
+    );
+    if (camera_stream_thread_.joinable()) {
+        camera_stream_thread_.join();
+    }
+    camera_stream_stage_.store(CameraStreamWorkerStage::kIdle);
+    camera_stream_encoder_.reset();
+    camera_stream_sink_ = nullptr;
+    camera_stream_fps_.store(0);
+    camera_stream_quality_.store(0);
+}
+
+void EspVideo::GrantStreamCredits(uint32_t credits) {
+    if (!camera_stream_running_.load() || credits == 0) {
+        return;
+    }
+    credits = MIN(credits, 4U);
+    auto current = camera_stream_credits_.load();
+    while (true) {
+        const uint32_t next = MIN(current, 4U - credits) + credits;
+        if (camera_stream_credits_.compare_exchange_weak(current, next)) {
+            return;
+        }
+    }
+}
+
+std::string EspVideo::GetStreamStatus() const {
+    char status[256];
+    snprintf(
+        status,
+        sizeof(status),
+        "{\"running\":%s,\"supported\":true,\"fps\":%d,\"quality\":%d,"
+        "\"credits\":%lu,\"frames\":%lu,\"encodeFailures\":%lu}",
+        camera_stream_running_.load() ? "true" : "false",
+        camera_stream_fps_.load(),
+        camera_stream_quality_.load(),
+        static_cast<unsigned long>(camera_stream_credits_.load()),
+        static_cast<unsigned long>(camera_stream_frames_.load()),
+        static_cast<unsigned long>(camera_stream_encode_failures_.load())
+    );
+    return status;
+}
+
+bool EspVideo::ClaimStreamCredit() {
+    auto current = camera_stream_credits_.load();
+    while (current > 0) {
+        if (camera_stream_credits_.compare_exchange_weak(current, current - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void EspVideo::RestoreStreamCredit() {
+    GrantStreamCredits(1);
+}
+
+void EspVideo::CameraStreamLoop() {
+    const TickType_t frame_interval = pdMS_TO_TICKS(
+        1000 / camera_stream_fps_.load()
+    );
+    TickType_t last_frame_tick = xTaskGetTickCount();
+    const std::string device_id = SystemInfo::GetMacAddress();
+
+    while (camera_stream_running_.load()) {
+        camera_stream_stage_.store(CameraStreamWorkerStage::kWaiting);
+        vTaskDelayUntil(&last_frame_tick, MAX(frame_interval, 1U));
+        if (!camera_stream_running_.load()) {
+            break;
+        }
+        camera_stream_stage_.store(CameraStreamWorkerStage::kCaptureLock);
+        std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+        camera_stream_stage_.store(CameraStreamWorkerStage::kDequeue);
+        struct v4l2_buffer buf = {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(video_fd_, VIDIOC_DQBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "Camera stream VIDIOC_DQBUF failed");
+            camera_stream_encode_failures_.fetch_add(1);
+            continue;
+        }
+
+        if (buf.index >= mmap_buffers_.size()) {
+            ESP_LOGE(TAG, "Camera stream received invalid buffer index %lu",
+                     static_cast<unsigned long>(buf.index));
+            camera_stream_encode_failures_.fetch_add(1);
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "Camera stream cleanup VIDIOC_QBUF failed");
+            }
+            continue;
+        }
+
+        const auto frame_action = SelectCameraStreamCapturedFrameAction(
+            ClaimStreamCredit()
+        );
+        if (frame_action == CameraStreamCapturedFrameAction::kDiscard) {
+            camera_stream_stage_.store(CameraStreamWorkerStage::kRequeue);
+            if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "Camera stream discard VIDIOC_QBUF failed");
+                camera_stream_encode_failures_.fetch_add(1);
+            }
+            continue;
+        }
+
+        const uint64_t captured_at_ms =
+            static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+        const uint8_t* jpeg = nullptr;
+        size_t jpeg_size = 0;
+        camera_stream_stage_.store(CameraStreamWorkerStage::kEncode);
+        const bool encoded = camera_stream_encoder_ != nullptr &&
+            camera_stream_encoder_->Encode(
+            static_cast<uint8_t*>(mmap_buffers_[buf.index].start),
+            buf.bytesused,
+            &jpeg,
+            &jpeg_size
+        );
+        const uint64_t encoded_at_ms =
+            static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+
+        camera_stream_stage_.store(CameraStreamWorkerStage::kRequeue);
+        if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "Camera stream VIDIOC_QBUF failed");
+        }
+
+        if (!encoded || jpeg == nullptr || jpeg_size == 0) {
+            ESP_LOGE(TAG, "Camera stream JPEG encode failed");
+            camera_stream_encode_failures_.fetch_add(1);
+            RestoreStreamCredit();
+            continue;
+        }
+
+        const uint32_t sequence = camera_stream_sequence_.fetch_add(1) + 1;
+        camera_stream_stage_.store(CameraStreamWorkerStage::kPublish);
+        camera_stream_sink_(
+            CameraStreamMetadata{
+                sequence,
+                captured_at_ms,
+                encoded_at_ms,
+                frame_.width,
+                frame_.height,
+                static_cast<uint8_t>(camera_stream_quality_.load()),
+                device_id,
+            },
+            jpeg,
+            jpeg_size
+        );
+        camera_stream_frames_.fetch_add(1);
+    }
+    camera_stream_stage_.store(CameraStreamWorkerStage::kIdle);
 }
 
 /**

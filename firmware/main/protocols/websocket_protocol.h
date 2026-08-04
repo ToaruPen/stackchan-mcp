@@ -3,17 +3,22 @@
 
 
 #include "protocol.h"
+#include "camera_datagram_protocol.h"
 
 #include <web_socket.h>
+#include <udp.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 #define WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
 #define WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED (1 << 1)
+#define WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_READY (1 << 2)
+#define WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_FAILED (1 << 3)
 #define WEBSOCKET_RECONNECT_INITIAL_INTERVAL_MS 5000
 #define WEBSOCKET_RECONNECT_MAX_INTERVAL_MS 60000
 
@@ -24,6 +29,11 @@ public:
 
     bool Start() override;
     bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) override;
+    bool SendCameraPacket(
+        uint32_t sequence,
+        const uint8_t* data,
+        size_t size
+    ) override;
     bool OpenAudioChannel() override;
     void CloseAudioChannel(bool send_goodbye = true) override;
     bool IsAudioChannelOpened() const override;
@@ -34,6 +44,11 @@ private:
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     EventGroupHandle_t event_group_handle_;
     std::unique_ptr<WebSocket> websocket_;
+    std::mutex camera_channel_mutex_;
+    std::unique_ptr<WebSocket> camera_websocket_;
+    std::unique_ptr<Udp> camera_udp_;
+    CameraDatagramToken camera_datagram_token_{};
+    size_t camera_datagram_max_bytes_ = kCameraDatagramMaxBytes;
     esp_timer_handle_t reconnect_timer_ = nullptr;
     // True while reconnect_timer_ has a pending one-shot retry. This keeps
     // independent failure/disconnect paths from double-arming the same retry
@@ -55,6 +70,7 @@ private:
     // read/write well-defined (the lambda runs on the WS task; the disarm
     // path runs on the main task).
     std::shared_ptr<std::atomic<bool>> current_notify_disconnect_;
+    std::shared_ptr<std::atomic<bool>> current_camera_notify_disconnect_;
     // Latch flipped by every code path that intentionally tears the
     // current socket down. Cleared the moment a fresh server hello is
     // acked. Checked by the deferred reconnect job that the timer
@@ -79,6 +95,8 @@ private:
     // so the timer-task read does not race with main-task websocket_.reset()
     // in OpenAudioChannelInternal / destructor / reconnect paths.
     std::atomic<bool> transport_connected_ = false;
+    std::atomic<bool> camera_websocket_connected_ = false;
+    std::atomic<bool> camera_datagram_ready_ = false;
     // Main-task snapshot of the candidate URL that completed the WebSocket
     // server-hello flow. GetConnectedUrl returns it only while the transport
     // flag is still true, so post-disconnect stale values are not reported.
@@ -92,6 +110,18 @@ private:
     bool SendText(const std::string& text) override;
     std::string GetHelloMessage();
     bool OpenAudioChannelInternal(bool report_error, bool arm_audio_channel = true);
+    bool OpenCameraChannel(
+        NetworkInterface* network,
+        const std::string& url,
+        const std::string& token
+    );
+    bool ConfigureCameraDatagram(
+        NetworkInterface* network,
+        const std::string& websocket_url,
+        const cJSON* root
+    );
+    void HandleCameraDatagram(const std::string& datagram);
+    void CloseCameraChannel();
     void ScheduleReconnect();
     void StopReconnectTimer();
 };

@@ -3,6 +3,8 @@
 #include "board.h"
 #include "system_info.h"
 #include "application.h"
+#include "camera_stream_capability.h"
+#include "camera_stream_protocol.h"
 #include "settings.h"
 
 #include <cstring>
@@ -89,6 +91,7 @@ WebsocketProtocol::~WebsocketProtocol() {
     if (current_notify_disconnect_) {
         current_notify_disconnect_->store(false);
     }
+    CloseCameraChannel();
     StopReconnectTimer();
     if (reconnect_timer_ != nullptr) {
         esp_timer_delete(reconnect_timer_);
@@ -147,6 +150,313 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     } else {
         return websocket_->Send(packet->payload.data(), packet->payload.size(), true);
     }
+}
+
+bool WebsocketProtocol::SendCameraPacket(
+    uint32_t sequence,
+    const uint8_t* data,
+    size_t size
+) {
+    std::lock_guard<std::mutex> lock(camera_channel_mutex_);
+    if (data == nullptr || size == 0 ||
+        SelectCameraStreamSendAction(camera_datagram_ready_.load()) !=
+            CameraStreamSendAction::kSendDatagram ||
+        camera_udp_ == nullptr || !camera_udp_->connected()) {
+        return false;
+    }
+    const auto datagrams = BuildCameraFrameDatagrams(
+        camera_datagram_token_,
+        sequence,
+        data,
+        size,
+        camera_datagram_max_bytes_
+    );
+    return SendCameraDatagramsOnce(
+        datagrams,
+        [this](const std::string& datagram) {
+            return camera_udp_->Send(datagram);
+        }
+    );
+}
+
+bool WebsocketProtocol::OpenCameraChannel(
+    NetworkInterface* network,
+    const std::string& url,
+    const std::string& token
+) {
+    CloseCameraChannel();
+    if (network == nullptr || url.empty()) {
+        return false;
+    }
+
+    auto camera_websocket = network->CreateWebSocket(2);
+    if (camera_websocket == nullptr) {
+        ESP_LOGE(TAG, "Failed to create dedicated camera websocket");
+        return false;
+    }
+    auto notify_disconnect = std::make_shared<std::atomic<bool>>(false);
+    auto disconnected_after_connect = std::make_shared<std::atomic<bool>>(false);
+
+    if (!token.empty()) {
+        camera_websocket->SetHeader("Authorization", token.c_str());
+    }
+    camera_websocket->SetHeader("Camera-Stream", "1");
+    camera_websocket->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    camera_websocket->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+    xEventGroupClearBits(
+        event_group_handle_,
+        WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_READY |
+            WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_FAILED
+    );
+    camera_websocket->OnData([this, network, url](
+        const char* data,
+        size_t len,
+        bool binary
+    ) {
+        if (binary) {
+            ESP_LOGW(TAG, "Ignoring binary data from camera media websocket");
+            return;
+        }
+        auto root = cJSON_ParseWithLength(data, len);
+        if (root == nullptr) {
+            ESP_LOGW(TAG, "Invalid camera media JSON");
+            return;
+        }
+        if (!ConfigureCameraDatagram(network, url, root)) {
+            ESP_LOGW(TAG, "Rejected camera media configuration");
+            xEventGroupSetBits(
+                event_group_handle_,
+                WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_FAILED
+            );
+        }
+        cJSON_Delete(root);
+        last_incoming_time_ = std::chrono::steady_clock::now();
+    });
+
+    camera_websocket->OnDisconnected([
+        this,
+        notify_disconnect,
+        disconnected_after_connect
+    ]() {
+        disconnected_after_connect->store(true, std::memory_order_release);
+        camera_datagram_ready_.store(false);
+        camera_websocket_connected_.store(false);
+        xEventGroupSetBits(
+            event_group_handle_,
+            WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_FAILED
+        );
+        const auto actions = SelectCameraMediaDisconnectActions(
+            notify_disconnect->exchange(false, std::memory_order_acq_rel)
+        );
+        if (!actions.reconnect) {
+            ESP_LOGI(TAG, "Camera media websocket disconnected intentionally");
+            return;
+        }
+        transport_connected_.store(false);
+        audio_channel_open_.store(false);
+        if (actions.notify_session_closed) {
+            if (on_disconnected_ != nullptr) {
+                on_disconnected_();
+            }
+            if (on_audio_channel_closed_ != nullptr) {
+                on_audio_channel_closed_();
+            }
+        }
+        ESP_LOGW(TAG, "Camera media websocket disconnected; reconnecting both transports");
+        ScheduleReconnect();
+    });
+
+    if (!camera_websocket->Connect(url.c_str())) {
+        ESP_LOGE(TAG, "Failed to connect dedicated camera websocket");
+        return false;
+    }
+
+    notify_disconnect->store(true, std::memory_order_release);
+    if (disconnected_after_connect->load(std::memory_order_acquire)) {
+        notify_disconnect->store(false, std::memory_order_release);
+        ESP_LOGE(TAG, "Dedicated camera websocket disconnected during connect");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(camera_channel_mutex_);
+        current_camera_notify_disconnect_ = notify_disconnect;
+        camera_websocket_ = std::move(camera_websocket);
+        camera_websocket_connected_.store(true);
+    }
+
+    const EventBits_t bits = xEventGroupWaitBits(
+        event_group_handle_,
+        WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_READY |
+            WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_FAILED,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(1500)
+    );
+    if (!(bits & WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_READY) ||
+        !camera_datagram_ready_.load(std::memory_order_acquire)) {
+        ESP_LOGE(TAG, "Camera datagram configuration timed out or failed");
+        CloseCameraChannel();
+        return false;
+    }
+    notify_disconnect->store(true, std::memory_order_release);
+    ESP_LOGI(TAG, "Dedicated camera websocket connected");
+    return true;
+}
+
+bool WebsocketProtocol::ConfigureCameraDatagram(
+    NetworkInterface* network,
+    const std::string& websocket_url,
+    const cJSON* root
+) {
+    const auto type = cJSON_GetObjectItem(root, "type");
+    const auto version = cJSON_GetObjectItem(root, "version");
+    const auto port = cJSON_GetObjectItem(root, "port");
+    const auto max_datagram_bytes = cJSON_GetObjectItem(
+        root,
+        "maxDatagramBytes"
+    );
+    const auto token_hex = cJSON_GetObjectItem(root, "token");
+    const auto advertised_host = cJSON_GetObjectItem(root, "host");
+    const auto parsed_token = cJSON_IsString(token_hex) &&
+            token_hex->valuestring != nullptr
+        ? ParseCameraDatagramTokenHex(token_hex->valuestring)
+        : std::nullopt;
+    const bool numeric_fields = cJSON_IsNumber(version) &&
+        cJSON_IsNumber(port) && cJSON_IsNumber(max_datagram_bytes);
+    const int parsed_version = numeric_fields ? version->valueint : 0;
+    const int parsed_port = numeric_fields ? port->valueint : 0;
+    const int parsed_max_datagram_bytes = numeric_fields
+        ? max_datagram_bytes->valueint
+        : 0;
+    if (!cJSON_IsString(type) || type->valuestring == nullptr ||
+        !numeric_fields ||
+        version->valuedouble != parsed_version ||
+        port->valuedouble != parsed_port ||
+        max_datagram_bytes->valuedouble != parsed_max_datagram_bytes ||
+        SelectCameraMediaTextAction(
+            type->valuestring,
+            parsed_version,
+            parsed_port,
+            parsed_max_datagram_bytes,
+            parsed_token.has_value()
+        ) != CameraMediaTextAction::kConfigureDatagram ||
+        network == nullptr) {
+        return false;
+    }
+
+    if (advertised_host != nullptr &&
+        (!cJSON_IsString(advertised_host) ||
+         advertised_host->valuestring == nullptr)) {
+        return false;
+    }
+    const auto host = SelectCameraDatagramHost(
+        advertised_host != nullptr ? advertised_host->valuestring : "",
+        websocket_url
+    );
+    if (!host.has_value()) {
+        return false;
+    }
+    auto udp = network->CreateUdp(3);
+    if (udp == nullptr) {
+        ESP_LOGE(TAG, "Failed to create camera datagram transport");
+        return false;
+    }
+    udp->OnMessage([this](const std::string& datagram) {
+        HandleCameraDatagram(datagram);
+    });
+    if (!udp->Connect(*host, parsed_port)) {
+        ESP_LOGE(TAG, "Failed to connect camera datagram transport");
+        return false;
+    }
+
+    std::unique_ptr<Udp> previous_udp;
+    {
+        std::lock_guard<std::mutex> lock(camera_channel_mutex_);
+        camera_datagram_ready_.store(false);
+        previous_udp = std::move(camera_udp_);
+        camera_datagram_token_ = *parsed_token;
+        camera_datagram_max_bytes_ =
+            static_cast<size_t>(parsed_max_datagram_bytes);
+        camera_udp_ = std::move(udp);
+    }
+    previous_udp.reset();
+
+    camera_datagram_ready_.store(true, std::memory_order_release);
+    const bool hello_sent = SendCameraDatagramHelloBurst(
+        *parsed_token,
+        [this](const std::string& hello) {
+            std::lock_guard<std::mutex> lock(camera_channel_mutex_);
+            if (camera_udp_ == nullptr) {
+                return -1;
+            }
+            return camera_udp_->Send(hello);
+        },
+        []() { vTaskDelay(pdMS_TO_TICKS(50)); }
+    );
+    if (!hello_sent) {
+        camera_datagram_ready_.store(false);
+        return false;
+    }
+    xEventGroupSetBits(
+        event_group_handle_,
+        WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_READY
+    );
+    ESP_LOGI(
+        TAG,
+        "Camera datagram ready: host=%s port=%d mtu=%d",
+        host->c_str(),
+        parsed_port,
+        parsed_max_datagram_bytes
+    );
+    return true;
+}
+
+void WebsocketProtocol::HandleCameraDatagram(const std::string& datagram) {
+    CameraDatagramToken token{};
+    {
+        std::lock_guard<std::mutex> lock(camera_channel_mutex_);
+        if (!camera_datagram_ready_.load() || camera_udp_ == nullptr) {
+            return;
+        }
+        token = camera_datagram_token_;
+    }
+    const auto credits = ParseCameraDatagramCredit(datagram, token);
+    if (!credits.has_value()) {
+        ESP_LOGW(TAG, "Ignoring invalid camera datagram credit");
+        return;
+    }
+    if (on_incoming_json_ == nullptr) {
+        return;
+    }
+    auto root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "camera_stream_credit");
+    cJSON_AddNumberToObject(root, "credits", *credits);
+    on_incoming_json_(root);
+    cJSON_Delete(root);
+    last_incoming_time_ = std::chrono::steady_clock::now();
+}
+
+void WebsocketProtocol::CloseCameraChannel() {
+    std::unique_ptr<WebSocket> websocket;
+    std::unique_ptr<Udp> udp;
+    {
+        std::lock_guard<std::mutex> lock(camera_channel_mutex_);
+        camera_datagram_ready_.store(false);
+        camera_websocket_connected_.store(false);
+        camera_datagram_token_.fill(0);
+        camera_datagram_max_bytes_ = kCameraDatagramMaxBytes;
+        if (current_camera_notify_disconnect_) {
+            current_camera_notify_disconnect_->store(
+                false,
+                std::memory_order_release
+            );
+            current_camera_notify_disconnect_.reset();
+        }
+        udp = std::move(camera_udp_);
+        websocket = std::move(camera_websocket_);
+    }
+    udp.reset();
+    websocket.reset();
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {
@@ -252,6 +562,7 @@ bool WebsocketProtocol::OpenAudioChannelInternal(bool report_error, bool arm_aud
     if (current_notify_disconnect_) {
         current_notify_disconnect_->store(false);
     }
+    CloseCameraChannel();
     StopReconnectTimer();
     websocket_.reset();
     // Clear session_id_ at the start of a fresh socket attempt so a
@@ -611,6 +922,20 @@ bool WebsocketProtocol::OpenAudioChannelInternal(bool report_error, bool arm_aud
             return false;
         }
 
+        if (camera_stream_protocol::kCameraStreamEnabled &&
+            !OpenCameraChannel(network, candidate_url, token)) {
+            ESP_LOGE(TAG, "Dedicated camera websocket failed for candidate %d/%d",
+                     static_cast<int>(i + 1), static_cast<int>(gateway_candidates.size()));
+            notify_disconnect->store(false, std::memory_order_release);
+            websocket_.reset();
+            continue;
+        }
+        if (disconnected_after_hello->load(std::memory_order_acquire)) {
+            CloseCameraChannel();
+            ESP_LOGW(TAG, "Control websocket disconnected while camera media connected; leaving reconnect to control disconnect handler");
+            return false;
+        }
+
         // ParseServerHello() already armed notify_disconnect on the WS
         // task (before setting the wait bit) so a near-simultaneous close
         // is handled by the lambda's reconnect path. Mirror it into the
@@ -623,6 +948,17 @@ bool WebsocketProtocol::OpenAudioChannelInternal(bool report_error, bool arm_aud
         transport_connected_.store(true);
         reconnect_interval_ms_ = WEBSOCKET_RECONNECT_INITIAL_INTERVAL_MS;
         StopReconnectTimer();
+        if (disconnected_after_hello->load(std::memory_order_acquire) ||
+            (camera_stream_protocol::kCameraStreamEnabled &&
+             (!camera_websocket_connected_.load(std::memory_order_acquire) ||
+              !camera_datagram_ready_.load(std::memory_order_acquire)))) {
+            transport_connected_.store(false);
+            audio_channel_open_.store(false);
+            CloseCameraChannel();
+            ESP_LOGW(TAG, "Transport disconnected during final connection handoff; rearming reconnect");
+            ScheduleReconnect();
+            return false;
+        }
 
         if (on_connected_ != nullptr) {
             on_connected_();
@@ -708,6 +1044,10 @@ std::string WebsocketProtocol::GetHelloMessage() {
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
+    if (camera_stream_protocol::kCameraStreamEnabled) {
+        cJSON_AddBoolToObject(features, "camera_stream", true);
+        cJSON_AddBoolToObject(features, "camera_datagram_v1", true);
+    }
     cJSON_AddItemToObject(root, "features", features);
     cJSON_AddStringToObject(root, "transport", "websocket");
     cJSON* audio_params = cJSON_CreateObject();

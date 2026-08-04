@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "mcp_message_dispatch.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -37,10 +38,28 @@ ListeningProfile ParseListenProfile(const cJSON* root) {
     return result.profile;
 }
 
+#if CONFIG_BOARD_TYPE_STACKCHAN
+void RefundCameraStreamCredit() {
+    auto camera = Board::GetInstance().GetCamera();
+    if (camera != nullptr) {
+        camera->GrantStreamCredits(1);
+    }
+}
+#endif
+
 } // namespace
 
 
-Application::Application() {
+Application::Application()
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    : camera_packet_send_lane_(
+          [this](const CameraStreamPacket& packet) {
+              return SendCameraPacket(packet);
+          },
+          RefundCameraStreamCredit
+      )
+#endif
+{
     event_group_ = xEventGroupCreate();
 
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
@@ -67,6 +86,9 @@ Application::Application() {
 }
 
 Application::~Application() {
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    camera_packet_send_lane_.Reset();
+#endif
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
@@ -498,7 +520,10 @@ void Application::InitializeProtocol() {
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
     // Force WebSocket protocol for the stackchan-mcp gateway (bypass OTA config)
-    protocol_ = std::make_unique<WebsocketProtocol>();
+    {
+        std::lock_guard<std::mutex> lock(protocol_mutex_);
+        protocol_ = std::make_unique<WebsocketProtocol>();
+    }
 
     protocol_->OnConnected([this]() {
         DismissAlert();
@@ -535,7 +560,22 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingJson([this, display, &board](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
-        if (strcmp(type->valuestring, "tts") == 0) {
+        if (!cJSON_IsString(type)) {
+            ESP_LOGW(TAG, "Incoming JSON message missing type");
+            return;
+        }
+        if (strcmp(type->valuestring, "camera_stream_credit") == 0) {
+            auto credits = cJSON_GetObjectItem(root, "credits");
+            auto camera = board.GetCamera();
+            if (camera == nullptr || !cJSON_IsNumber(credits) ||
+                credits->valuedouble < 1 || credits->valuedouble > 4) {
+                ESP_LOGW(TAG, "Invalid camera stream credit message");
+                return;
+            }
+            camera->GrantStreamCredits(
+                static_cast<uint32_t>(credits->valuedouble)
+            );
+        } else if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this, &board]() {
@@ -1144,7 +1184,13 @@ void Application::Reboot() {
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         protocol_->CloseAudioChannel();
     }
-    protocol_.reset();
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    camera_packet_send_lane_.Reset();
+#endif
+    {
+        std::lock_guard<std::mutex> lock(protocol_mutex_);
+        protocol_.reset();
+    }
     audio_service_.Stop();
 
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1267,12 +1313,31 @@ bool Application::CanEnterSleepMode() {
 }
 
 void Application::SendMcpMessage(const std::string& payload) {
-    // Always schedule to run in main task for thread safety
-    Schedule([this, payload = std::move(payload)]() {
-        if (protocol_) {
-            protocol_->SendMcpMessage(payload);
-        }
-    });
+    stackchan_mcp::DispatchMcpMessage(
+        false,
+        payload,
+        [this](std::function<void()> task) {
+            Schedule(std::move(task));
+        },
+        [this](const std::string& message) {
+            if (protocol_) {
+                protocol_->SendMcpMessage(message);
+            }
+        });
+}
+
+void Application::SendMcpMessageFromMainTask(const std::string& payload) {
+    stackchan_mcp::DispatchMcpMessage(
+        true,
+        payload,
+        [this](std::function<void()> task) {
+            Schedule(std::move(task));
+        },
+        [this](const std::string& message) {
+            if (protocol_) {
+                protocol_->SendMcpMessage(message);
+            }
+        });
 }
 
 void Application::SendStackChanEvent(
@@ -1303,6 +1368,49 @@ void Application::SendStackChanEvent(
         cJSON_Delete(root);
     });
 }
+
+#if CONFIG_BOARD_TYPE_STACKCHAN
+void Application::SendCameraJpeg(
+    const CameraStreamMetadata& metadata,
+    const uint8_t* jpeg,
+    size_t jpeg_size
+) {
+    auto bytes = BuildCameraStreamPacket(metadata, jpeg, jpeg_size);
+    if (bytes.empty()) {
+        ESP_LOGW(TAG, "Rejected invalid camera stream frame");
+        RefundCameraStreamCredit();
+        return;
+    }
+
+    camera_packet_send_lane_.Publish(
+        CameraStreamPacket{
+            metadata.sequence,
+            std::move(bytes),
+        }
+    );
+}
+
+void Application::QuiesceCameraPackets() {
+    camera_packet_send_lane_.Quiesce();
+}
+
+bool Application::SendCameraPacket(const CameraStreamPacket& packet) {
+    std::lock_guard<std::mutex> lock(protocol_mutex_);
+    if (!protocol_ || !protocol_->IsTransportConnected()) {
+        return false;
+    }
+    if (!protocol_->SendCameraPacket(
+            packet.sequence,
+            packet.bytes.data(),
+            packet.bytes.size()
+        )) {
+        ESP_LOGW(TAG, "Failed to send camera frame %lu",
+                 static_cast<unsigned long>(packet.sequence));
+        return false;
+    }
+    return true;
+}
+#endif
 
 void Application::SendJsonString(const std::string& json_str) {
     // Thread-safe generic WS text frame send. Used by board-initiated
@@ -1353,6 +1461,7 @@ void Application::ResetProtocol() {
             protocol_->CloseAudioChannel();
         }
         // Reset protocol
+        std::lock_guard<std::mutex> lock(protocol_mutex_);
         protocol_.reset();
     });
 }
