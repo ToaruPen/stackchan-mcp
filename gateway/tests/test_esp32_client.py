@@ -110,6 +110,29 @@ async def test_manager_owns_and_stops_head_target_lane() -> None:
     assert manager.head_target_lane.status()["phase"] == "stopped"
 
 
+@pytest.mark.asyncio
+async def test_manager_retains_camera_frame_tasks_until_completion() -> None:
+    manager = ESP32Manager()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle_frame() -> None:
+        started.set()
+        await release.wait()
+
+    task = asyncio.create_task(handle_frame())
+    manager._track_camera_frame_task(task)
+    await started.wait()
+
+    assert task in manager._camera_frame_tasks
+
+    release.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert manager._camera_frame_tasks == set()
+
+
 class _ClosingHandlerWebSocket:
     """Fake server-side WebSocket that raises a close exception from iteration."""
 
@@ -1523,7 +1546,10 @@ async def test_camera_stream_credit_lease_uses_only_the_datagram_endpoint(
     monkeypatch.setattr(esp32_client, "CAMERA_DATAGRAM_CREDIT_INTERVAL_S", 0.001)
 
     await manager.begin_camera_datagram_stream()
-    await asyncio.sleep(0.003)
+    for _ in range(100):
+        if len(sent) >= 2:
+            break
+        await asyncio.sleep(0.001)
     await manager.end_camera_datagram_stream()
     count_after_stop = len(sent)
     await asyncio.sleep(0.003)

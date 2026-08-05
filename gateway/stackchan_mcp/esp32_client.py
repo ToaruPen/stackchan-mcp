@@ -555,6 +555,7 @@ class ESP32Manager:
             "source_mismatch_packets": 0,
         }
         self._camera_credit_task: asyncio.Task[None] | None = None
+        self._camera_frame_tasks: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
         self._camera_lock = asyncio.Lock()
         self._camera_ready_lock = asyncio.Lock()
@@ -750,9 +751,22 @@ class ESP32Manager:
             return
         completed = session.accept(data, addr, now_ms=int(_monotonic() * 1_000))
         if completed is not None:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._handle_camera_datagram_frame(completed, session=session)
             )
+            self._track_camera_frame_task(task)
+
+    def _track_camera_frame_task(self, task: asyncio.Task[None]) -> None:
+        self._camera_frame_tasks.add(task)
+        task.add_done_callback(self._camera_frame_task_completed)
+
+    def _camera_frame_task_completed(self, task: asyncio.Task[None]) -> None:
+        self._camera_frame_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("camera frame processing failed: %s", error)
 
     async def _handle_camera_datagram_frame(
         self,
@@ -799,6 +813,11 @@ class ESP32Manager:
         except Exception as exc:
             logger.warning("camera stream shutdown cleanup failed: %s", exc)
         await self.end_camera_datagram_stream()
+        frame_tasks = tuple(self._camera_frame_tasks)
+        for task in frame_tasks:
+            task.cancel()
+        if frame_tasks:
+            await asyncio.gather(*frame_tasks, return_exceptions=True)
         async with self._camera_lock:
             camera_connection = self._camera_connection
             self._camera_connection = None

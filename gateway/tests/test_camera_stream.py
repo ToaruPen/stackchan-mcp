@@ -479,7 +479,10 @@ async def test_stream_service_idle_lease_expires_and_clears_latest_frame() -> No
     await asyncio.sleep(0.015)
     assert service.status()["running"] is True
 
-    await asyncio.sleep(0.02)
+    for _ in range(20):
+        if service.status()["running"] is False:
+            break
+        await asyncio.sleep(0.005)
 
     assert service.status()["running"] is False
     assert service.status()["subscribers"] == 0

@@ -20,7 +20,7 @@ TypeScript/Vitest, Python/pytest.
 
 ---
 
-### Task 1: Reproduce The Lost Terminal Frame
+## Task 1: Reproduce The Lost Terminal Frame
 
 **Files:**
 - Modify: `firmware/host_test/test_head_spring_motion.cc`
@@ -35,7 +35,7 @@ TypeScript/Vitest, Python/pytest.
       and require the new test to fail because the completion helper or exact
       terminal-frame selector is absent.
 
-### Task 2: Keep The Final Frame Until Acknowledgement
+## Task 2: Keep The Final Frame Until Acknowledgement
 
 **Files:**
 - Modify: `firmware/main/boards/stackchan/head_spring_motion.h`
@@ -51,7 +51,7 @@ TypeScript/Vitest, Python/pytest.
 - [x] Run the focused host executable and require every spring test to pass.
 - [x] Run `just firmware-host-test` and require all firmware host tests to pass.
 
-### Task 3: Select One Faster Follow Candidate
+## Task 3: Select One Faster Follow Candidate
 
 **Files:**
 - Inspect: Pico attention replay and capacity reports
@@ -69,7 +69,7 @@ TypeScript/Vitest, Python/pytest.
       before the gain changes.
 - [x] Run the focused Pico tests, typecheck, and lint.
 
-### Task 4: Prepare Attended Physical Review
+## Task 4: Prepare Attended Physical Review
 
 **Files:**
 - Create or update: private report under `~/.pico/field-reports/`

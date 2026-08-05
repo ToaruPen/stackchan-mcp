@@ -441,7 +441,7 @@ class HeadTargetLane:
                         asyncio.shield(worker),
                         timeout=self._device_call_timeout_seconds,
                     )
-            except TimeoutError as exc:
+            except asyncio.TimeoutError as exc:
                 if worker is not None:
                     worker.cancel()
                     await asyncio.gather(worker, return_exceptions=True)

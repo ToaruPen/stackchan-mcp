@@ -199,7 +199,7 @@ class LatestCameraFrameStore:
                     ),
                     timeout=timeout_s,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 return None
             return self._matching_frame(after_sequence)
 

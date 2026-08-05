@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "camera_stream_protocol.h"
 
 #define TAG "MCP"
 
@@ -119,17 +120,22 @@ void McpServer::AddCommonTools() {
                 return camera->Explain(question);
             });
 
+    }
+#endif
+
 #if CONFIG_BOARD_TYPE_STACKCHAN
+    auto stream_camera = board.GetCamera();
+    if (stream_camera) {
         AddTool("self.camera.start_stream",
             "Start the credit-controlled JPEG camera stream.",
             PropertyList({
                 Property("fps", kPropertyTypeInteger, 15, 1, 20),
                 Property("quality", kPropertyTypeInteger, 60, 1, 100)
             }),
-            [camera](const PropertyList& properties) -> ReturnValue {
+            [stream_camera](const PropertyList& properties) -> ReturnValue {
                 const int fps = properties["fps"].value<int>();
                 const int quality = properties["quality"].value<int>();
-                const bool started = camera->StartStream(
+                const bool started = stream_camera->StartStream(
                     fps,
                     quality,
                     [](const CameraStreamMetadata& metadata,
@@ -151,8 +157,8 @@ void McpServer::AddCommonTools() {
         AddTool("self.camera.stop_stream",
             "Stop the JPEG camera stream and discard pending frames.",
             PropertyList(),
-            [camera](const PropertyList&) -> ReturnValue {
-                camera->StopStream();
+            [stream_camera](const PropertyList&) -> ReturnValue {
+                stream_camera->StopStream();
                 Application::GetInstance().QuiesceCameraPackets();
                 return true;
             });
@@ -160,10 +166,9 @@ void McpServer::AddCommonTools() {
         AddTool("self.camera.stream_status",
             "Get the current JPEG camera stream status.",
             PropertyList(),
-            [camera](const PropertyList&) -> ReturnValue {
-                return camera->GetStreamStatus();
+            [stream_camera](const PropertyList&) -> ReturnValue {
+                return stream_camera->GetStreamStatus();
             });
-#endif
     }
 #endif
 
@@ -520,7 +525,7 @@ void McpServer::ReplyError(
     std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
     payload += std::to_string(id);
     payload += ",\"error\":{\"message\":\"";
-    payload += message;
+    payload += camera_stream_protocol::EscapeJsonString(message);
     payload += "\"}}";
     auto& app = Application::GetInstance();
     if (from_main_task) {

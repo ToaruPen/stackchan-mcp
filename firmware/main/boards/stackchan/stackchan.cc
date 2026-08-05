@@ -5810,6 +5810,17 @@ private:
             }),
             [this](const PropertyList& properties) -> ReturnValue {
                 if (properties["cached_motion_state"].value<bool>()) {
+                    if (!servo_ok_) {
+                        cJSON* root = cJSON_CreateObject();
+                        cJSON_AddNullToObject(root, "yaw");
+                        cJSON_AddNullToObject(root, "pitch");
+                        cJSON_AddStringToObject(
+                            root, "error", "Servo bus is unavailable");
+                        cJSON_AddBoolToObject(root, "servo_ok", false);
+                        cJSON_AddNumberToObject(root, "yaw_attempts", 0);
+                        cJSON_AddNumberToObject(root, "pitch_attempts", 0);
+                        return root;
+                    }
                     int yaw = 0;
                     int pitch = 0;
                     int target_yaw = 0;

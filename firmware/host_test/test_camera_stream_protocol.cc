@@ -28,6 +28,25 @@ TEST(CameraStreamProtocolTest, DiscardsCapturedFramesWithoutDeliveryCredit) {
     );
 }
 
+TEST(CameraStreamProtocolTest, UsesSensorDimensionsForUnrotatedStreamInput) {
+    const auto rotated =
+        SelectCameraStreamDimensions(240, 320, 320, 240, true);
+    EXPECT_EQ(rotated.width, 320);
+    EXPECT_EQ(rotated.height, 240);
+
+    const auto unrotated =
+        SelectCameraStreamDimensions(320, 240, 0, 0, false);
+    EXPECT_EQ(unrotated.width, 320);
+    EXPECT_EQ(unrotated.height, 240);
+}
+
+TEST(CameraStreamProtocolTest, EscapesJsonRpcErrorMessageCharacters) {
+    EXPECT_EQ(
+        camera_stream_protocol::EscapeJsonString("bad \"message\"\\\n"),
+        "bad \\\"message\\\"\\\\\\n"
+    );
+}
+
 TEST(CameraStreamProtocolTest, NeverFallsBackToTheControlTransportForCameraMedia) {
     EXPECT_EQ(
         SelectCameraStreamSendAction(false),
@@ -390,7 +409,10 @@ TEST(CameraStreamProtocolTest, QuiesceWaitsForInflightAndDiscardsQueuedPacket) {
             condition.wait(lock, [&]() { return release_send; });
             return true;
         },
-        [&]() { refunded.fetch_add(1); }
+        [&]() {
+            refunded.fetch_add(1);
+            condition.notify_all();
+        }
     );
 
     EXPECT_TRUE(owner.Publish(CameraStreamPacket{40, {1}}));
@@ -410,9 +432,13 @@ TEST(CameraStreamProtocolTest, QuiesceWaitsForInflightAndDiscardsQueuedPacket) {
         quiesced = true;
         condition.notify_all();
     });
-    std::this_thread::yield();
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(condition.wait_for(
+            lock,
+            std::chrono::milliseconds(100),
+            [&]() { return refunded.load() == 1; }
+        ));
         EXPECT_FALSE(quiesced);
         release_send = true;
     }

@@ -54,11 +54,10 @@ configuration are outside this tuning change.
 - Host test observes the spring reaching rest while retaining the final-frame
   flag, then observes the flag clear only after a successful exact-target
   write.
-- Existing stale-frame, momentum-retention, native-step, firmware host,
+- Existing stale-frame, momentum-retention, native-step, firmware-host,
   Gateway, and Pico focused tests remain green.
 - Deterministic replay/capacity evidence names the single changed follow
   parameter and compares it with the current baseline.
 - The next attended physical review repeats the 3-second small-lane test and
   15-second face-follow test, requires home error within one degree, and asks
   the user to judge smoothness and tracking speed directly.
-

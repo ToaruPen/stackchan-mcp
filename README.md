@@ -369,7 +369,7 @@ gateway configurations that tear the WebSocket session down after the handshake
 connection attempt.
 
 For non-LAN setups, see [`docs/remote-access.md`](docs/remote-access.md).
-Camera-enabled firmware requires protected direct UDP reachability to the
+Camera-enabled firmware requires a protected direct UDP route to the
 gateway as well as the WebSocket path; TCP-only Tailscale Funnel is not
 supported, and the UDP listener must not be exposed to the public internet.
 

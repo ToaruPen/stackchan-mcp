@@ -1016,9 +1016,22 @@ bool EspVideo::StartStream(int fps, int quality, StreamFrameSink sink) {
         return false;
     }
 
-    camera_stream_encoder_ = EspVideoStreamJpegEncoder::Create(
+    camera_stream_dimensions_ = SelectCameraStreamDimensions(
         frame_.width,
         frame_.height,
+#ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+        sensor_width_,
+        sensor_height_,
+        true
+#else
+        0,
+        0,
+        false
+#endif
+    );
+    camera_stream_encoder_ = EspVideoStreamJpegEncoder::Create(
+        camera_stream_dimensions_.width,
+        camera_stream_dimensions_.height,
         sensor_format_,
         static_cast<uint8_t>(quality)
     );
@@ -1183,8 +1196,8 @@ void EspVideo::CameraStreamLoop() {
                 sequence,
                 captured_at_ms,
                 encoded_at_ms,
-                frame_.width,
-                frame_.height,
+                camera_stream_dimensions_.width,
+                camera_stream_dimensions_.height,
                 static_cast<uint8_t>(camera_stream_quality_.load()),
                 device_id,
             },

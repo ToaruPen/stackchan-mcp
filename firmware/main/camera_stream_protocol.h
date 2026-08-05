@@ -2,7 +2,6 @@
 #define CAMERA_STREAM_PROTOCOL_H
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -26,6 +25,22 @@ struct CameraStreamMetadata {
     uint8_t quality = 0;
     std::string device_id;
 };
+
+struct CameraStreamDimensions {
+    uint16_t width = 0;
+    uint16_t height = 0;
+};
+
+inline CameraStreamDimensions SelectCameraStreamDimensions(
+    uint16_t frame_width,
+    uint16_t frame_height,
+    uint16_t sensor_width,
+    uint16_t sensor_height,
+    bool frame_dimensions_are_rotated) {
+    return frame_dimensions_are_rotated
+        ? CameraStreamDimensions{sensor_width, sensor_height}
+        : CameraStreamDimensions{frame_width, frame_height};
+}
 
 namespace camera_stream_protocol {
 
@@ -291,7 +306,10 @@ public:
           }) {}
 
     ~CameraPacketSendLane() {
-        stopping_.store(true);
+        {
+            std::lock_guard<std::mutex> lock(wait_mutex_);
+            stopping_ = true;
+        }
         condition_.notify_all();
         if (worker_.joinable()) {
             worker_.join();
@@ -306,7 +324,7 @@ public:
 
     void Publish(CameraStreamPacket packet) {
         std::lock_guard<std::mutex> lock(wait_mutex_);
-        if (stopping_.load()) {
+        if (stopping_) {
             refund_();
             return;
         }
@@ -327,9 +345,9 @@ private:
         while (true) {
             std::unique_lock<std::mutex> lock(wait_mutex_);
             condition_.wait(lock, [this]() {
-                return stopping_.load() || slot_.HasPacket();
+                return stopping_ || slot_.HasPacket();
             });
-            if (stopping_.load()) {
+            if (stopping_) {
                 return;
             }
             auto packet = slot_.Take();
@@ -351,7 +369,7 @@ private:
     std::mutex wait_mutex_;
     std::condition_variable condition_;
     bool sending_ = false;
-    std::atomic<bool> stopping_{false};
+    bool stopping_ = false;
     std::thread worker_;
 };
 

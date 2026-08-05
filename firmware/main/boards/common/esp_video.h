@@ -46,6 +46,7 @@ private:
     std::thread camera_stream_thread_;
     std::mutex capture_mutex_;
     std::unique_ptr<EspVideoStreamJpegEncoder> camera_stream_encoder_;
+    CameraStreamDimensions camera_stream_dimensions_;
     Camera::StreamFrameSink camera_stream_sink_;
     std::atomic<bool> camera_stream_running_{false};
     std::atomic<uint32_t> camera_stream_credits_{0};
