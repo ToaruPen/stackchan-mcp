@@ -17,7 +17,7 @@
 
 ---
 
-### Task 1: 750ms home recovery契約をREDで固定する
+## Task 1: 750ms home recovery契約をREDで固定する
 
 **Files:**
 - Modify: `gateway/tests/test_face_follow.py`
@@ -118,7 +118,7 @@ uv run pytest -q \
 
 Expected: recovery modeとhome moveが未実装のためfailure。
 
-### Task 2: pure controllerへ最小home recoveryを実装する
+## Task 2: pure controllerへ最小home recoveryを実装する
 
 **Files:**
 - Modify: `gateway/stackchan_mcp/face_follow.py`
@@ -180,7 +180,7 @@ Run: `cd gateway && uv run pytest -q tests/test_face_follow.py`
 
 Expected: 20 tests pass（pre-PR regressionを含む）。
 
-### Task 3: 非実機gateを通す
+## Task 3: 非実機gateを通す
 
 **Files:**
 - Validate: `gateway/stackchan_mcp/face_follow.py`
@@ -212,7 +212,7 @@ Expected: Ruffとdiff errorなし、旧scan identifierなし。
 既存 `test_service_owns_fixed_camera_lane_and_safe_home_lifecycle` が、stop時のlane停止、
 pitch 37度approach、pitch 33度home、camera releaseの順を維持することを確認する。
 
-### Task 4: 60秒反復live A/Bを行う
+## Task 4: 60秒反復live A/Bを行う
 
 **Files:**
 - Create at runtime: `/Users/monsoon/.pico/field-runs/stackchan-loss-home-recovery-ab-750ms-1-*/stackchan-loss-home-recovery-ab-750ms-1.json`
@@ -246,7 +246,7 @@ auto-sleep false、active/pending最大1、error/stale/post-stop dispatch 0を�
 `replaced` はlatest-only coalescingとして回数を記録し、方向反転後の最新targetが
 採用されることを確認する。
 
-### Task 5: 主観評価と採用可否を記録する
+## Task 5: 主観評価と採用可否を記録する
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-05-stackchan-gateway-face-follow.md`

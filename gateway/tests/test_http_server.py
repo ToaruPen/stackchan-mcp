@@ -102,9 +102,15 @@ class FakeHeadTargetLane:
         return {"phase": "stopped", "accepted": self.accepted}
 
 
+class FakeFaceFollow:
+    def status(self) -> dict[str, str]:
+        return {"phase": "stopped"}
+
+
 class FakeGateway:
     def __init__(self, *, connected: bool = True) -> None:
         self.esp32 = FakeESP32(connected=connected)
+        self.face_follow = FakeFaceFollow()
 
 
 @contextlib.asynccontextmanager
@@ -525,7 +531,7 @@ def test_bypass_tools_include_status_and_follow_pose_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
+async def test_bypass_tools_do_not_enter_dispatcher() -> None:
     assert BYPASS_TOOLS == frozenset(
         {
             "get_status",
@@ -538,7 +544,7 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
     queue = CommandQueue(capacity=2)
 
     async def dispatch(_item: QueueItem):
-        raise AssertionError("get_status must bypass the command queue")
+        raise AssertionError("bypass tools must not enter the command queue")
 
     app = build_app(
         queue,
@@ -552,10 +558,21 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
     async with _client(app) as client:
         session_id = await _initialize(client)
         response = await _call_tool(client, session_id=session_id, name="get_status")
+        follow_response = await _call_tool(
+            client,
+            session_id=session_id,
+            name="stackchan_face_follow",
+            arguments={"action": "status"},
+        )
 
     payload = response.json()
     status = json.loads(payload["result"]["content"][0]["text"])
+    follow_payload = follow_response.json()
+    follow_status = json.loads(
+        follow_payload["result"]["content"][0]["text"]
+    )
     assert status["connected"] is True
+    assert follow_status["phase"] == "stopped"
     assert queue.depth == 0
 
 

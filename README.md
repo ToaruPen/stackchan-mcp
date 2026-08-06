@@ -388,7 +388,8 @@ If you installed via `pip install stackchan-mcp`:
       "command": "stackchan-mcp",
       "env": {
         "STACKCHAN_TOKEN": "your-secret-token-here",
-        "VISION_HOST": "your.host.lan.ip"
+        "VISION_HOST": "your.host.lan.ip",
+        "STACKCHAN_FACE_FOLLOW_MODEL": "/absolute/path/to/model.onnx"
       }
     }
   }
@@ -406,7 +407,10 @@ If you installed from source via `uv`:
       "args": [
         "run", "--directory", "/path/to/stackchan-mcp/gateway",
         "python", "-m", "stackchan_mcp"
-      ]
+      ],
+      "env": {
+        "STACKCHAN_FACE_FOLLOW_MODEL": "/absolute/path/to/model.onnx"
+      }
     }
   }
 }
@@ -425,6 +429,9 @@ export STACKCHAN_FACE_FOLLOW_MODEL=/absolute/path/to/model.onnx
 ```
 
 The gateway does not download a model or select a fallback automatically.
+GUI-launched MCP hosts may not inherit variables exported by your shell, so
+pass `STACKCHAN_FACE_FOLLOW_MODEL` in the MCP server's `env` block as shown
+above.
 Any MCP host, including Moco, only registers `stackchan-mcp` as an MCP server
 and calls `stackchan_face_follow(action="start" | "status" | "stop")`; it does
 not need camera, ONNX, or controller code of its own. Frames remain in bounded

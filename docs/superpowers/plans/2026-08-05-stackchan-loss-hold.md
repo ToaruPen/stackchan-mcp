@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: loss時hold契約をREDで固定する
+## Task 1: loss時hold契約をREDで固定する
 
 **Files:**
 - Modify: `gateway/tests/test_face_follow.py`
@@ -75,7 +75,7 @@ uv run pytest -q \
 
 Expected: 2 failures。旧実装がそれぞれ `scan` とhome moveを返すため失敗する。
 
-### Task 2: pure controllerからscanを除去してGREENにする
+## Task 2: pure controllerからscanを除去してGREENにする
 
 **Files:**
 - Modify: `gateway/stackchan_mcp/face_follow.py`
@@ -127,7 +127,7 @@ rg -n 'LOST_HOLD_MS|SCAN_DWELL_MS|scan_arrived_at_ms|mode="scan"|def _scan' \
 
 Expected: no matches。
 
-### Task 3: 非実機gateを通す
+## Task 3: 非実機gateを通す
 
 **Files:**
 - Validate: `gateway/stackchan_mcp/face_follow.py`
@@ -162,7 +162,7 @@ git diff -- gateway/stackchan_mcp/face_follow.py gateway/tests/test_face_follow.
 
 Expected: no-candidate時scan除去と対応test以外にcontroller定数・service lifecycle変更なし。
 
-### Task 4: 30秒live A/Bを行う
+## Task 4: 30秒live A/Bを行う
 
 **Files:**
 - Create at runtime: `/Users/monsoon/.pico/field-runs/stackchan-loss-hold-ab-100ms-1-*/stackchan-loss-hold-ab-100ms-1.json`
@@ -190,7 +190,7 @@ no-candidate counterが増えてtarget_visible falseになった区間で、再�
 finallyでface-followをstopし、yaw 0度相当／pitch 33度、camera stopped、device camera
 stopped、auto-sleep false、active/pending最大1、post-stop dispatch 0を確認する。
 
-### Task 5: A/B結果を記録して判断を止める
+## Task 5: A/B結果を記録して判断を止める
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-05-stackchan-gateway-face-follow.md`

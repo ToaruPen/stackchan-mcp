@@ -233,6 +233,21 @@ def test_metrics_decompose_initial_acquisition_and_longest_reacquisition_gap() -
     }
 
 
+def test_metrics_do_not_treat_suppressed_ticks_as_target_loss() -> None:
+    metrics = FaceFollowMetrics(started_at_ms=0)
+    metrics.record_outcome("target_selected", now_ms=100)
+    metrics.record_outcome("tick_overlap_suppressed", now_ms=200)
+
+    during_overlap = metrics.status(now_ms=250)
+    metrics.record_outcome("target_selected", now_ms=300)
+    after_target = metrics.status(now_ms=300)
+
+    assert during_overlap["outcomes"]["tick_overlap_suppressed"] == 1
+    assert during_overlap["reacquisition"]["current_gap_ms"] == 0
+    assert during_overlap["reacquisition"]["current_outcomes"] == {}
+    assert after_target["reacquisition"]["episodes"] == 0
+
+
 def test_metrics_record_vertical_loss_origin_and_axis_step_limits_once() -> None:
     metrics = FaceFollowMetrics(started_at_ms=0)
     target = TargetObservation(
@@ -483,7 +498,11 @@ async def test_service_owns_fixed_camera_lane_and_safe_home_lifecycle() -> None:
     ]
     assert stopped["safety"]["home_commanded"] is True
     assert stopped["camera"]["running"] is False
-    assert await service.stop() == stopped
+    repeated = await service.stop()
+    assert repeated["phase"] == "stopped"
+    assert repeated["safety"] == stopped["safety"]
+    assert repeated["camera"] == stopped["camera"]
+    assert repeated["errors"] == stopped["errors"]
 
 
 @pytest.mark.asyncio

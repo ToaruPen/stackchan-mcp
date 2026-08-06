@@ -235,7 +235,7 @@ def load_pinto_face_detector(model_path: str) -> PintoFaceDetector:
 
 
 def create_pinto_preprocessor() -> Callable[[bytes], object]:
-    """Create the lazy Pillow/NumPy RGB-to-BGR NCHW preprocessor."""
+    """Create the approved PINTO raw 0..255 BGR NCHW preprocessor."""
     try:
         import numpy as np
         from PIL import Image, ImageOps

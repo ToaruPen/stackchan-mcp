@@ -1656,6 +1656,14 @@ def test_camera_datagram_status_preserves_safe_counters_after_session_retirement
     assert manager.camera_datagram_status()["completed_frames"] == 1
 
 
+def test_camera_datagram_status_has_empty_histograms_before_session_preparation():
+    status = ESP32Manager().camera_datagram_status()
+
+    empty_histogram = {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0}
+    assert status["assembly_ms"] == empty_histogram
+    assert status["completed_interval_ms"] == empty_histogram
+
+
 @pytest.mark.asyncio
 async def test_manager_stop_closes_the_dedicated_camera_connection():
     media_ws = _FakeWebSocket()

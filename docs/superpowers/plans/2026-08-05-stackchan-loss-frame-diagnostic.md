@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: 実機とgatewayのpreflightを固定する
+## Task 1: 実機とgatewayのpreflightを固定する
 
 **Files:**
 - Read: `/Users/monsoon/.pico/stackchan-mcp/local-gateway.env`
@@ -38,7 +38,7 @@ Expected: device connected、pitch 33度、yaw 0度相当、auto-sleep false、c
 
 座位・正面中央から開始し、開始10秒後のMacのチャイム1回で、その場に正面を向いたまま立つと伝える。探索動作は行わない。
 
-### Task 2: productionコードを変えずに30秒Runを取得する
+## Task 2: productionコードを変えずに30秒Runを取得する
 
 **Files:**
 - Create at runtime: Run directory内の権限700 `loss-frames/` directory
@@ -69,7 +69,7 @@ MAX_SAVED_JPEGS = 5
 Expected: active/pending最大1、post-stop dispatch 0、pitch 33度、yaw 0度相当、
 camera stopped、device camera stopped、auto-sleep false。
 
-### Task 3: 最長lossを選び最大5枚だけ一時保存する
+## Task 3: 最長lossを選び最大5枚だけ一時保存する
 
 **Files:**
 - Read: `gateway/stackchan_mcp/face_follow_detector.py`
@@ -93,7 +93,7 @@ filenameは `f"{order:02d}-{role}-seq-{sequence}.jpg"` とし、directoryは700�
 Run JSONへsequence、role、brightness mean、black/white clipping percentage、class別最大
 confidenceだけを記録し、画像bytesや秘密値は書かない。
 
-### Task 4: 画像を確認して原因オーナーを確定する
+## Task 4: 画像を確認して原因オーナーを確定する
 
 **Files:**
 - Read: Task 3で選んだ最大5枚
@@ -115,7 +115,7 @@ bodyの可視性を判定する。
 固まり、再捕捉の遅れ、急跳び、頷き、逆方向の有無をRun JSONへ追記する。ユーザーが
 直前に報告した「固まってから遅れてこちらを向いた」を前回Runの評価として分離する。
 
-### Task 5: 一時画像を削除し証拠を検証する
+## Task 5: 一時画像を削除し証拠を検証する
 
 **Files:**
 - Delete: Task 3の一時JPEGとその専用directory

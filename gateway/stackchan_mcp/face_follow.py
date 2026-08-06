@@ -331,6 +331,8 @@ class FaceFollowMetrics:
             )
             self._loss_origin_recorded = True
 
+        if outcome == "tick_overlap_suppressed":
+            return
         if self._first_target_at_ms is None:
             _increment(self._initial_outcomes, outcome)
         elif self._last_target_at_ms is not None:
@@ -799,19 +801,19 @@ class FaceFollowService:
             lease_id = self._require_lease()
             pose = self._refresh_lane_pose(lease_id)
             observed_at_ms = self._now_ms()
-            target = select_attention_target(detections)
-            if target is None:
-                outcome: FaceFollowOutcome = (
-                    "no_candidate" if not detections else "association_rejected"
-                )
-            else:
-                outcome = "target_selected"
             transition = advance_attention(
                 self._state,
                 now_ms=observed_at_ms,
                 observed_at_ms=observed_at_ms,
                 current_pose=pose,
                 detections=detections,
+            )
+            outcome: FaceFollowOutcome = (
+                "target_selected"
+                if transition.target is not None
+                else (
+                    "no_candidate" if not detections else "association_rejected"
+                )
             )
             if transition.target is not None:
                 self._metrics.record_target_diagnostics(

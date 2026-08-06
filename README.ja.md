@@ -322,7 +322,8 @@ TLS レイヤの切断、ハンドシェイク後にセッションを閉じる�
       "command": "stackchan-mcp",
       "env": {
         "STACKCHAN_TOKEN": "your-secret-token-here",
-        "VISION_HOST": "your.host.lan.ip"
+        "VISION_HOST": "your.host.lan.ip",
+        "STACKCHAN_FACE_FOLLOW_MODEL": "/absolute/path/to/model.onnx"
       }
     }
   }
@@ -340,7 +341,10 @@ TLS レイヤの切断、ハンドシェイク後にセッションを閉じる�
       "args": [
         "run", "--directory", "/path/to/stackchan-mcp/gateway",
         "python", "-m", "stackchan_mcp"
-      ]
+      ],
+      "env": {
+        "STACKCHAN_FACE_FOLLOW_MODEL": "/absolute/path/to/model.onnx"
+      }
     }
   }
 }
@@ -359,6 +363,8 @@ export STACKCHAN_FACE_FOLLOW_MODEL=/absolute/path/to/model.onnx
 ```
 
 gatewayがmodelを自動downloadしたり、別modelへfallbackしたりすることはありません。
+GUIから起動するMCP hostはshellで `export` した変数を継承しないことがあるため、上記の
+MCP server設定の `env` に `STACKCHAN_FACE_FOLLOW_MODEL` を渡してください。
 Mocoを含むMCP host側は `stackchan-mcp` をMCP serverとして登録し、
 `stackchan_face_follow(action="start" | "status" | "stop")` を呼ぶだけです。
 camera、ONNX、controllerのコードをMocoへ直接組み込む必要はありません。人物追従で
