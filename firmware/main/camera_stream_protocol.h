@@ -20,11 +20,37 @@ struct CameraStreamMetadata {
     uint32_t sequence = 0;
     uint64_t captured_at_ms = 0;
     uint64_t encoded_at_ms = 0;
+    uint64_t capture_wait_us = 0;
+    uint64_t encode_us = 0;
     uint16_t width = 0;
     uint16_t height = 0;
     uint8_t quality = 0;
     std::string device_id;
 };
+
+struct CameraStreamStatusSnapshot {
+    bool running = false;
+    int fps = 0;
+    int quality = 0;
+    uint32_t credits = 0;
+    uint32_t frames = 0;
+    uint32_t encode_failures = 0;
+    uint32_t no_credit_drops = 0;
+};
+
+inline std::string BuildCameraStreamStatus(
+    const CameraStreamStatusSnapshot& status
+) {
+    return
+        "{\"running\":" + std::string(status.running ? "true" : "false") +
+        ",\"supported\":true" +
+        ",\"fps\":" + std::to_string(status.fps) +
+        ",\"quality\":" + std::to_string(status.quality) +
+        ",\"credits\":" + std::to_string(status.credits) +
+        ",\"frames\":" + std::to_string(status.frames) +
+        ",\"encodeFailures\":" + std::to_string(status.encode_failures) +
+        ",\"noCreditDrops\":" + std::to_string(status.no_credit_drops) + "}";
+}
 
 struct CameraStreamDimensions {
     uint16_t width = 0;
@@ -221,6 +247,8 @@ inline std::vector<uint8_t> BuildCameraStreamPacket(
         ",\"seq\":" + std::to_string(metadata.sequence) +
         ",\"captureTimestampMs\":" + std::to_string(metadata.captured_at_ms) +
         ",\"deviceEncodedAtMs\":" + std::to_string(metadata.encoded_at_ms) +
+        ",\"deviceCaptureWaitUs\":" + std::to_string(metadata.capture_wait_us) +
+        ",\"deviceEncodeUs\":" + std::to_string(metadata.encode_us) +
         ",\"quality\":" + std::to_string(metadata.quality) + "}";
 
     if (header.size() > std::numeric_limits<uint16_t>::max() ||

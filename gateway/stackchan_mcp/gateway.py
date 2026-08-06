@@ -14,6 +14,7 @@ from aiohttp import web
 
 from .capture_server import create_capture_app, stage_avatar_set
 from .esp32_client import ESP32Manager
+from .face_follow import FaceFollowService
 from .mdns_advertiser import MdnsAdvertiser
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,12 @@ class Gateway:
 
     def __init__(self):
         self.esp32 = ESP32Manager()
+        self.face_follow = FaceFollowService(
+            device=self.esp32,
+            camera_stream=self.esp32.camera_stream,
+            frames=self.esp32.camera_frames,
+            head_lane=self.esp32.head_target_lane,
+        )
         self._running = False
         self._http_runner: web.AppRunner | None = None
         # Phase 4.5 avatar: kept so load_avatar_set can stage payloads
@@ -87,11 +94,16 @@ class Gateway:
 
         A TCP proxy may terminate the camera setup WebSocket locally, so its
         public hostname and observed peer address aren't usable for UDP. The
-        existing LAN-facing VISION_HOST is the natural default in that setup.
+        existing LAN-facing VISION_HOST is the natural default in that setup
+        when it also owns the capture URL. With an explicit VISION_URL, leave
+        the host empty so a directly connected device reuses its control peer.
         """
-        return os.getenv("STACKCHAN_CAMERA_DATAGRAM_HOST") or os.getenv(
-            "VISION_HOST", ""
-        )
+        explicit_host = os.getenv("STACKCHAN_CAMERA_DATAGRAM_HOST")
+        if explicit_host is not None:
+            return explicit_host
+        if os.getenv("VISION_URL"):
+            return ""
+        return os.getenv("VISION_HOST", "")
 
     @property
     def audio_hook_url(self) -> str:
@@ -191,6 +203,11 @@ class Gateway:
 
     async def stop(self) -> None:
         """Stop the gateway."""
+        try:
+            await self.face_follow.stop()
+        except Exception as exc:  # pragma: no cover - defensive shutdown guard
+            logger.warning("face follow shutdown failed: %s", exc)
+
         # Cancel any active pose-stream follower before the rest of the
         # shutdown sequence closes gateway-side services.
         try:

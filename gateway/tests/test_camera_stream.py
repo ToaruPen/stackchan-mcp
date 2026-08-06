@@ -29,28 +29,32 @@ def scl1_frame(
     sequence: int = 7,
     captured_at_ms: int = 1000,
     encoded_at_ms: int = 1012,
+    capture_wait_us: int | None = 1_700,
+    encode_us: int | None = 12_300,
     width: int = 320,
     height: int = 240,
     quality: int = 60,
     device_id: str = "stackchan-test",
     jpeg: bytes = JPEG,
 ) -> bytes:
-    header = json.dumps(
-        {
-            "frameId": str(sequence),
-            "deviceId": device_id,
-            "mimeType": "image/jpeg",
-            "width": width,
-            "height": height,
-            "byteLength": len(jpeg),
-            "transport": "binary",
-            "seq": sequence,
-            "captureTimestampMs": captured_at_ms,
-            "deviceEncodedAtMs": encoded_at_ms,
-            "quality": quality,
-        },
-        separators=(",", ":"),
-    ).encode()
+    header_fields: dict[str, object] = {
+        "frameId": str(sequence),
+        "deviceId": device_id,
+        "mimeType": "image/jpeg",
+        "width": width,
+        "height": height,
+        "byteLength": len(jpeg),
+        "transport": "binary",
+        "seq": sequence,
+        "captureTimestampMs": captured_at_ms,
+        "deviceEncodedAtMs": encoded_at_ms,
+        "quality": quality,
+    }
+    if capture_wait_us is not None:
+        header_fields["deviceCaptureWaitUs"] = capture_wait_us
+    if encode_us is not None:
+        header_fields["deviceEncodeUs"] = encode_us
+    header = json.dumps(header_fields, separators=(",", ":")).encode()
     return b"SCL1" + bytes((1, 0)) + len(header).to_bytes(2, "big") + header + jpeg
 
 
@@ -71,10 +75,86 @@ def test_parse_camera_frame_decodes_scl1_metadata_and_jpeg() -> None:
     assert frame.captured_at_ms == 1000
     assert frame.encoded_at_ms == 1012
     assert frame.received_at_ms == 1040
+    assert frame.capture_wait_us == 1_700
+    assert frame.encode_us == 12_300
     assert frame.width == 320
     assert frame.height == 240
     assert frame.quality == 60
     assert frame.jpeg == JPEG
+
+
+@pytest.mark.asyncio
+async def test_legacy_scl1_delivers_without_polluting_exact_stage_timings() -> None:
+    store = LatestCameraFrameStore()
+    frame = parse_camera_frame(
+        scl1_frame(capture_wait_us=None, encode_us=None),
+        max_frame_bytes=1024,
+        received_at_ms=1_040,
+        received_monotonic_ms=2_040,
+    )
+    assert frame is not None
+    assert frame.capture_wait_us is None
+    assert frame.encode_us is None
+
+    assert await store.publish(frame) is True
+
+    status = store.status()
+    assert status["timing"]["device_capture_wait_us"]["count"] == 0
+    assert status["timing"]["device_encode_us"]["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_latest_store_aggregates_camera_stage_timings_and_wait_path() -> None:
+    store = LatestCameraFrameStore()
+    first = parse_camera_frame(
+        scl1_frame(
+            sequence=1,
+            captured_at_ms=1_000,
+            encoded_at_ms=1_012,
+            capture_wait_us=1_700,
+            encode_us=12_300,
+        ),
+        max_frame_bytes=1024,
+        received_at_ms=2_000,
+        received_monotonic_ms=3_000,
+    )
+    second = parse_camera_frame(
+        scl1_frame(
+            sequence=2,
+            captured_at_ms=1_064,
+            encoded_at_ms=1_076,
+            capture_wait_us=2_100,
+            encode_us=11_900,
+        ),
+        max_frame_bytes=1024,
+        received_at_ms=50_000,
+        received_monotonic_ms=3_066,
+    )
+    assert first is not None
+    assert second is not None
+
+    await store.publish(first)
+    await store.publish(second)
+    delivered = await store.wait_for_frame(after_sequence=None, timeout_s=0)
+
+    assert delivered is not None
+    status = store.status()
+    assert status["timing"]["device_capture_interval_ms"] == {
+        "count": 1,
+        "p50": 64,
+        "p95": 64,
+        "p99": 64,
+        "max": 64,
+    }
+    assert status["timing"]["device_capture_wait_us"]["p95"] == 2_100
+    assert status["timing"]["device_encode_us"]["p95"] == 13_000
+    assert status["timing"]["gateway_receive_interval_ms"]["p95"] == 66
+    assert status["wait"] == {
+        "calls": 1,
+        "immediate_deliveries": 1,
+        "waited_deliveries": 0,
+        "timeouts": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -131,7 +211,15 @@ async def test_latest_store_replaces_only_with_newer_sequence() -> None:
     latest = await store.wait_for_frame(after_sequence=None, timeout_s=0)
     assert latest is not None
     assert latest.sequence == 5
-    assert store.status() == {
+    status = store.status()
+    assert {key: status[key] for key in (
+        "available",
+        "sequence",
+        "received_frames",
+        "replaced_frames",
+        "stale_frames",
+        "max_jpeg_bytes",
+    )} == {
         "available": True,
         "sequence": 5,
         "received_frames": 2,

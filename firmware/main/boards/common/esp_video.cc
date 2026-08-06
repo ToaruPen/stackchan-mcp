@@ -1045,6 +1045,7 @@ bool EspVideo::StartStream(int fps, int quality, StreamFrameSink sink) {
     camera_stream_sequence_.store(0);
     camera_stream_frames_.store(0);
     camera_stream_encode_failures_.store(0);
+    camera_stream_no_credit_drops_.store(0);
     camera_stream_stage_.store(CameraStreamWorkerStage::kWaiting);
     camera_stream_running_.store(true);
     camera_stream_thread_ = std::thread([this]() { CameraStreamLoop(); });
@@ -1085,20 +1086,15 @@ void EspVideo::GrantStreamCredits(uint32_t credits) {
 }
 
 std::string EspVideo::GetStreamStatus() const {
-    char status[256];
-    snprintf(
-        status,
-        sizeof(status),
-        "{\"running\":%s,\"supported\":true,\"fps\":%d,\"quality\":%d,"
-        "\"credits\":%lu,\"frames\":%lu,\"encodeFailures\":%lu}",
-        camera_stream_running_.load() ? "true" : "false",
-        camera_stream_fps_.load(),
-        camera_stream_quality_.load(),
-        static_cast<unsigned long>(camera_stream_credits_.load()),
-        static_cast<unsigned long>(camera_stream_frames_.load()),
-        static_cast<unsigned long>(camera_stream_encode_failures_.load())
-    );
-    return status;
+    return BuildCameraStreamStatus(CameraStreamStatusSnapshot{
+        .running = camera_stream_running_.load(),
+        .fps = camera_stream_fps_.load(),
+        .quality = camera_stream_quality_.load(),
+        .credits = camera_stream_credits_.load(),
+        .frames = camera_stream_frames_.load(),
+        .encode_failures = camera_stream_encode_failures_.load(),
+        .no_credit_drops = camera_stream_no_credit_drops_.load(),
+    });
 }
 
 bool EspVideo::ClaimStreamCredit() {
@@ -1134,11 +1130,15 @@ void EspVideo::CameraStreamLoop() {
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
+        const uint64_t dequeue_started_at_us =
+            static_cast<uint64_t>(esp_timer_get_time());
         if (ioctl(video_fd_, VIDIOC_DQBUF, &buf) != 0) {
             ESP_LOGE(TAG, "Camera stream VIDIOC_DQBUF failed");
             camera_stream_encode_failures_.fetch_add(1);
             continue;
         }
+        const uint64_t dequeued_at_us =
+            static_cast<uint64_t>(esp_timer_get_time());
 
         if (buf.index >= mmap_buffers_.size()) {
             ESP_LOGE(TAG, "Camera stream received invalid buffer index %lu",
@@ -1154,6 +1154,7 @@ void EspVideo::CameraStreamLoop() {
             ClaimStreamCredit()
         );
         if (frame_action == CameraStreamCapturedFrameAction::kDiscard) {
+            camera_stream_no_credit_drops_.fetch_add(1);
             camera_stream_stage_.store(CameraStreamWorkerStage::kRequeue);
             if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
                 ESP_LOGE(TAG, "Camera stream discard VIDIOC_QBUF failed");
@@ -1162,11 +1163,12 @@ void EspVideo::CameraStreamLoop() {
             continue;
         }
 
-        const uint64_t captured_at_ms =
-            static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+        const uint64_t captured_at_ms = dequeued_at_us / 1000ULL;
         const uint8_t* jpeg = nullptr;
         size_t jpeg_size = 0;
         camera_stream_stage_.store(CameraStreamWorkerStage::kEncode);
+        const uint64_t encode_started_at_us =
+            static_cast<uint64_t>(esp_timer_get_time());
         const bool encoded = camera_stream_encoder_ != nullptr &&
             camera_stream_encoder_->Encode(
             static_cast<uint8_t*>(mmap_buffers_[buf.index].start),
@@ -1174,8 +1176,9 @@ void EspVideo::CameraStreamLoop() {
             &jpeg,
             &jpeg_size
         );
-        const uint64_t encoded_at_ms =
-            static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+        const uint64_t encoded_at_us =
+            static_cast<uint64_t>(esp_timer_get_time());
+        const uint64_t encoded_at_ms = encoded_at_us / 1000ULL;
 
         camera_stream_stage_.store(CameraStreamWorkerStage::kRequeue);
         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
@@ -1193,13 +1196,21 @@ void EspVideo::CameraStreamLoop() {
         camera_stream_stage_.store(CameraStreamWorkerStage::kPublish);
         camera_stream_sink_(
             CameraStreamMetadata{
-                sequence,
-                captured_at_ms,
-                encoded_at_ms,
-                camera_stream_dimensions_.width,
-                camera_stream_dimensions_.height,
-                static_cast<uint8_t>(camera_stream_quality_.load()),
-                device_id,
+                .sequence = sequence,
+                .captured_at_ms = captured_at_ms,
+                .encoded_at_ms = encoded_at_ms,
+                .capture_wait_us = dequeued_at_us >= dequeue_started_at_us
+                    ? dequeued_at_us - dequeue_started_at_us
+                    : 0,
+                .encode_us = encoded_at_us >= encode_started_at_us
+                    ? encoded_at_us - encode_started_at_us
+                    : 0,
+                .width = camera_stream_dimensions_.width,
+                .height = camera_stream_dimensions_.height,
+                .quality = static_cast<uint8_t>(
+                    camera_stream_quality_.load()
+                ),
+                .device_id = device_id,
             },
             jpeg,
             jpeg_size

@@ -2,6 +2,7 @@
 #define MCP_SERVER_H
 
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <functional>
@@ -456,7 +457,8 @@ private:
     void DoToolCall(
         int id,
         const std::string& tool_name,
-        const cJSON* tool_arguments);
+        const cJSON* tool_arguments,
+        uint64_t received_at_us);
 
     std::vector<McpTool*> tools_;
 };

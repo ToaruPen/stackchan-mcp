@@ -167,6 +167,41 @@ def test_assembler_completes_one_frame_from_out_of_order_chunks() -> None:
         "stale_chunks": 0,
         "expired_frames": 0,
         "invalid_frames": 0,
+        "assembly_ms": {"count": 1, "p50": 0, "p95": 0, "p99": 0, "max": 0},
+        "completed_interval_ms": {
+            "count": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+        },
+    }
+
+
+def test_assembler_aggregates_chunk_assembly_and_completion_interval() -> None:
+    assembler = LatestFrameAssembler()
+    first = split_frame(token=TOKEN, sequence=1, frame=bytes(2_000))
+    second = split_frame(token=TOKEN, sequence=2, frame=bytes(2_000))
+
+    assert assembler.push(first[0], now_ms=100) is None
+    assert assembler.push(first[1], now_ms=107) == bytes(2_000)
+    assert assembler.push(second[0], now_ms=160) is None
+    assert assembler.push(second[1], now_ms=169) == bytes(2_000)
+
+    status = assembler.status()
+    assert status["assembly_ms"] == {
+        "count": 2,
+        "p50": 7,
+        "p95": 9,
+        "p99": 9,
+        "max": 9,
+    }
+    assert status["completed_interval_ms"] == {
+        "count": 1,
+        "p50": 62,
+        "p95": 62,
+        "p99": 62,
+        "max": 62,
     }
 
 
@@ -195,6 +230,14 @@ def test_assembler_replaces_incomplete_frame_with_newer_sequence() -> None:
         "stale_chunks": 1,
         "expired_frames": 0,
         "invalid_frames": 0,
+        "assembly_ms": {"count": 1, "p50": 0, "p95": 0, "p99": 0, "max": 0},
+        "completed_interval_ms": {
+            "count": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+        },
     }
 
 
@@ -236,6 +279,14 @@ def test_assembler_reset_clears_frame_bytes_and_counters() -> None:
         "stale_chunks": 0,
         "expired_frames": 0,
         "invalid_frames": 0,
+        "assembly_ms": {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0},
+        "completed_interval_ms": {
+            "count": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+        },
     }
 
 
@@ -409,6 +460,14 @@ async def test_session_wait_ready_and_close_clear_state() -> None:
         "expired_frames": 0,
         "invalid_frames": 0,
         "source_mismatch_packets": 0,
+        "assembly_ms": {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0},
+        "completed_interval_ms": {
+            "count": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+        },
     }
 
 

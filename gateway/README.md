@@ -58,7 +58,9 @@ Edit `.env`:
 - `STACKCHAN_TOKEN`: Bearer token for ESP32 auth (must match firmware setting)
 - `STACKCHAN_CAMERA_DATAGRAM_HOST`: protected LAN or routed-VPN address that
   the ESP32 can reach directly over UDP. Camera UDP uses the same numeric port
-  as `WS_PORT`. Do not expose it to the public internet.
+  as `WS_PORT`. Do not expose it to the public internet. When this is unset and
+  `VISION_URL` is explicit, a directly connected ESP32 reuses the host from its
+  control WebSocket instead of the separate `VISION_HOST` setting.
 - `VISION_URL`: full public capture URL for remote access tunnels, such as
   `https://stackchan.example.ts.net:8443/capture`
 - `VISION_TOKEN`: optional separate Bearer token for capture uploads; if empty,
@@ -67,6 +69,9 @@ Edit `.env`:
   (something like `192.168.x.y` on a typical home network — run `ifconfig`
   or `ip addr` to find it). Required for `take_photo` when `VISION_URL` is not
   set.
+- `STACKCHAN_FACE_FOLLOW_MODEL`: explicit local path to a PINTO head/face
+  ONNX model. Required only for `stackchan_face_follow(action="start")`.
+  The gateway does not auto-download or choose a fallback model.
 
 ## Run
 
@@ -178,6 +183,7 @@ Same shape, under `mcpServers`.
 | `get_device_info` | ESP32 device status (battery, volume, WiFi, etc.) |
 | `take_photo(question?)` | Trigger camera capture; returns saved JPEG path |
 | `camera_stream(action, fps?, quality?)` | Start, stop, or inspect the reference-counted latest-JPEG stream. `fps` is `1..20`; `quality` is `1..100`. |
+| `stackchan_face_follow(action)` | Start, inspect, or stop gateway-owned face follow. The MCP host only controls lifecycle; camera, PINTO inference, controller state, and the latest-only head lane remain in this process. Requires `stackchan-mcp[face-follow]`. |
 | `set_volume(volume)` | Speaker volume 0-100 |
 | `set_brightness(brightness)` | Screen brightness 0-100 |
 | `move_head(yaw, pitch, speed?)` | Drive yaw + pitch servos |
@@ -209,6 +215,14 @@ backpressure, and clears the JPEG bytes after the final subscriber releases
 the stream. An authenticated `/camera/latest` read renews a 30-second idle
 lease; if a client exits without sending `stop`, the gateway stops the producer
 and clears the retained JPEG when that lease expires.
+
+For face follow, install the optional dependencies with
+`uv tool install 'stackchan-mcp[face-follow]'` (or the equivalent `pipx`
+command), set `STACKCHAN_FACE_FOLLOW_MODEL`, then call
+`stackchan_face_follow(action="start")`. `status` returns only bounded counters
+and latency histograms; it does not return frames or detection boxes. `stop`
+drains the head lane, commands the safe yaw 0 / pitch 33 home pose, and releases
+its camera subscription.
 
 The 12 base LEDs are 12× WS2812C wired to the PY32L020 IO expander
 (expander pin 13, not an ESP32 GPIO), so all four LED tools share the

@@ -953,6 +953,41 @@ async def _dispatch_mcp_tool(
             ]
         return [TextContent(type="text", text=json.dumps(status))]
 
+    if name == "stackchan_face_follow":
+        unexpected = sorted(set(arguments) - {"action"})
+        if unexpected:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": (
+                                "unexpected field for face-follow lifecycle: "
+                                f"{unexpected[0]}"
+                            )
+                        }
+                    ),
+                )
+            ]
+        action = arguments.get("action")
+        try:
+            if action == "start":
+                status = await gateway.face_follow.start()
+            elif action == "status":
+                status = gateway.face_follow.status()
+            elif action == "stop":
+                status = await gateway.face_follow.stop()
+            else:
+                raise ValueError("action must be one of: start, status, stop")
+        except (ConnectionError, RuntimeError, ValueError) as exc:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": str(exc)}),
+                )
+            ]
+        return [TextContent(type="text", text=json.dumps(status))]
+
     if name == "say":
         try:
             result = await synthesize_and_send(arguments, gateway=gateway)
@@ -1417,6 +1452,26 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                             "default": 60,
                         },
                     },
+                },
+            ),
+            Tool(
+                name="stackchan_face_follow",
+                description=(
+                    "Start, inspect, or stop gateway-owned StackChan face follow. "
+                    "The gateway owns camera frames, PINTO inference, the accepted "
+                    "controller, and the latest-only head lane; an MCP host only "
+                    "controls this lifecycle."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["start", "status", "stop"],
+                        }
+                    },
+                    "required": ["action"],
                 },
             ),
             Tool(

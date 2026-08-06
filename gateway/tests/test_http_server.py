@@ -521,6 +521,7 @@ def test_bypass_tools_include_status_and_follow_pose_stream() -> None:
     assert "camera_stream" in BYPASS_TOOLS
     assert "stackchan_follow_pose_stream" in BYPASS_TOOLS
     assert "stackchan_head_target_lane" in BYPASS_TOOLS
+    assert "stackchan_face_follow" in BYPASS_TOOLS
 
 
 @pytest.mark.asyncio
@@ -531,6 +532,7 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
             "camera_stream",
             "stackchan_follow_pose_stream",
             "stackchan_head_target_lane",
+            "stackchan_face_follow",
         }
     )
     queue = CommandQueue(capacity=2)

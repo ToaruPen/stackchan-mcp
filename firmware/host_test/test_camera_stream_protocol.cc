@@ -28,6 +28,23 @@ TEST(CameraStreamProtocolTest, DiscardsCapturedFramesWithoutDeliveryCredit) {
     );
 }
 
+TEST(CameraStreamProtocolTest, StreamStatusReportsNoCreditDropsSeparately) {
+    const CameraStreamStatusSnapshot status{
+        .running = true,
+        .fps = 20,
+        .quality = 60,
+        .credits = 0,
+        .frames = 284,
+        .encode_failures = 0,
+        .no_credit_drops = 172,
+    };
+
+    EXPECT_EQ(
+        BuildCameraStreamStatus(status),
+        R"({"running":true,"supported":true,"fps":20,"quality":60,"credits":0,"frames":284,"encodeFailures":0,"noCreditDrops":172})"
+    );
+}
+
 TEST(CameraStreamProtocolTest, UsesSensorDimensionsForUnrotatedStreamInput) {
     const auto rotated =
         SelectCameraStreamDimensions(240, 320, 320, 240, true);
@@ -155,6 +172,8 @@ TEST(CameraStreamProtocolTest, BuildsScl1EnvelopeWithBoundedJsonHeader) {
         .sequence = 7,
         .captured_at_ms = 1000,
         .encoded_at_ms = 1012,
+        .capture_wait_us = 1700,
+        .encode_us = 12300,
         .width = 320,
         .height = 240,
         .quality = 60,
@@ -186,6 +205,8 @@ TEST(CameraStreamProtocolTest, BuildsScl1EnvelopeWithBoundedJsonHeader) {
     EXPECT_NE(header.find("\"seq\":7"), std::string::npos);
     EXPECT_NE(header.find("\"captureTimestampMs\":1000"), std::string::npos);
     EXPECT_NE(header.find("\"deviceEncodedAtMs\":1012"), std::string::npos);
+    EXPECT_NE(header.find("\"deviceCaptureWaitUs\":1700"), std::string::npos);
+    EXPECT_NE(header.find("\"deviceEncodeUs\":12300"), std::string::npos);
     EXPECT_NE(header.find("\"quality\":60"), std::string::npos);
 
     const std::vector<uint8_t> jpeg(

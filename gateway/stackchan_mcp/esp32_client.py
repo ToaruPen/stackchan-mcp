@@ -544,7 +544,7 @@ class ESP32Manager:
         self._camera_datagram_port = 0
         self._camera_datagram_host = ""
         self._camera_datagram_sessions: dict[bytes, CameraDatagramSession] = {}
-        self._last_camera_datagram_status: dict[str, int | bool] = {
+        self._last_camera_datagram_status: dict[str, Any] = {
             "ready": False,
             "pending": False,
             "completed_frames": 0,
@@ -913,7 +913,7 @@ class ESP32Manager:
                 self._camera_ready_pair = None
         await media.close()
 
-    def camera_datagram_status(self) -> dict[str, int | bool]:
+    def camera_datagram_status(self) -> dict[str, Any]:
         media = self._camera_connection
         if (
             media is not None

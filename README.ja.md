@@ -50,6 +50,7 @@
 | `get_device_info` | ESP32 デバイス状態 (バッテリー/音量/WiFi 等) | ✅ |
 | `take_photo(question?)` | カメラ撮影 → JPEG 保存 → パス返す | ✅ |
 | `camera_stream(action, fps?, quality?)` | 最新JPEG 1枚だけをメモリに保持するstreamを参照数管理（`start` / `stop` / `status`）。画像はディスクへ保存しない | ✅ |
+| `stackchan_face_follow(action)` | gateway所有の人物追従を開始・状態取得・停止（`start` / `status` / `stop`）。camera frame、PINTO推論、controller、latest-only head laneはすべて `stackchan-mcp` 内に置き、MCP hostへ組み込まない。`[face-follow]` extraと `STACKCHAN_FACE_FOLLOW_MODEL` が必要 | ✅ |
 | `set_volume(volume)` | スピーカー音量 (0-100) | ✅ |
 | `set_brightness(brightness)` | 画面明るさ (0-100) | ✅ |
 | `move_head(yaw, pitch, speed?)` | 首を動かす (サーボ)。`pitch` は M5Stack 推奨運用レンジ `5..85` に制限される。ファームウェア側のハードクランプ (`0..88`) を使いたい場合は、firmware-side の `set_head_angles` デバイスツールを利用する | ✅ |
@@ -346,6 +347,22 @@ TLS レイヤの切断、ハンドシェイク後にセッションを閉じる�
 ```
 
 詳細は `gateway/README.md` 参照。
+
+### オプション: 人物追従のセットアップ
+
+ローカル推論用の依存関係を含めてgatewayをインストールし、既存のPINTO head/face
+ONNX modelを明示指定します。
+
+```bash
+uv tool install 'stackchan-mcp[face-follow]'
+export STACKCHAN_FACE_FOLLOW_MODEL=/absolute/path/to/model.onnx
+```
+
+gatewayがmodelを自動downloadしたり、別modelへfallbackしたりすることはありません。
+Mocoを含むMCP host側は `stackchan-mcp` をMCP serverとして登録し、
+`stackchan_face_follow(action="start" | "status" | "stop")` を呼ぶだけです。
+camera、ONNX、controllerのコードをMocoへ直接組み込む必要はありません。人物追従で
+使うframeはgatewayの有限メモリ内だけに保持し、diskへ保存しません。
 
 ### gateway user-defaults TOML ファイル
 

@@ -6,9 +6,10 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import struct
-from typing import cast
+from typing import Any, cast
 import zlib
 
+from .camera_metrics import BoundedLatencyHistogram
 
 SCU1_MAGIC = b"SCU1"
 SCU1_VERSION = 1
@@ -83,13 +84,19 @@ class LatestFrameAssembler:
         self._stale_chunks = 0
         self._expired_frames = 0
         self._invalid_frames = 0
+        self._assembly_ms = BoundedLatencyHistogram(maximum_bucket=30_000)
+        self._completed_interval_ms = BoundedLatencyHistogram(
+            maximum_bucket=30_000
+        )
+        self._last_completed_at_ms: int | None = None
 
     def clear_stream_state(self) -> None:
         """Discard frame bytes and ordering while preserving diagnostics."""
         self._pending = None
         self._latest_sequence = None
+        self._last_completed_at_ms = None
 
-    def status(self) -> dict[str, int | bool]:
+    def status(self) -> dict[str, Any]:
         return {
             "pending": self._pending is not None,
             "completed_frames": self._completed_frames,
@@ -97,6 +104,8 @@ class LatestFrameAssembler:
             "stale_chunks": self._stale_chunks,
             "expired_frames": self._expired_frames,
             "invalid_frames": self._invalid_frames,
+            "assembly_ms": self._assembly_ms.status(),
+            "completed_interval_ms": self._completed_interval_ms.status(),
         }
 
     def push(self, datagram: bytes, *, now_ms: int) -> bytes | None:
@@ -175,6 +184,13 @@ class LatestFrameAssembler:
             self._invalid_frames += 1
             return None
         self._completed_frames += 1
+        self._assembly_ms.add(now_ms - pending.started_at_ms)
+        if (
+            self._last_completed_at_ms is not None
+            and now_ms >= self._last_completed_at_ms
+        ):
+            self._completed_interval_ms.add(now_ms - self._last_completed_at_ms)
+        self._last_completed_at_ms = now_ms
         return frame
 
 
@@ -280,7 +296,7 @@ class CameraDatagramSession:
         self._source_mismatch_packets = 0
         self._invalid_packets = 0
 
-    def status(self) -> dict[str, int | bool]:
+    def status(self) -> dict[str, Any]:
         assembler = self._assembler.status()
         assembler["invalid_frames"] = (
             int(assembler["invalid_frames"]) + self._invalid_packets
