@@ -116,6 +116,18 @@ def test_camera_datagram_host_prefers_explicit_host_then_lan_host(monkeypatch):
     assert gw.camera_datagram_host == "192.0.2.10"
 
 
+def test_camera_datagram_host_uses_control_peer_with_explicit_vision_url(
+    monkeypatch,
+):
+    monkeypatch.setenv("VISION_URL", "https://stackchan.example/capture")
+    monkeypatch.setenv("VISION_HOST", "192.0.2.10")
+    monkeypatch.delenv("STACKCHAN_CAMERA_DATAGRAM_HOST", raising=False)
+
+    gw = Gateway()
+
+    assert gw.camera_datagram_host == ""
+
+
 def test_vision_token_prefers_explicit_token(monkeypatch):
     """VISION_TOKEN can be separated from the WebSocket token."""
     monkeypatch.setenv("VISION_TOKEN", "capture-token")
@@ -155,6 +167,28 @@ async def test_gateway_start_stop(monkeypatch):
     assert gw._running is False
     assert ("http_cleanup",) in calls
     assert ("esp32_stop",) in calls
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_stops_face_follow_before_esp32_transport() -> None:
+    events: list[str] = []
+
+    class FaceFollow:
+        async def stop(self) -> dict[str, str]:
+            events.append("face_follow_stop")
+            return {"phase": "stopped"}
+
+    class Esp32:
+        async def stop(self) -> None:
+            events.append("esp32_stop")
+
+    gateway = Gateway()
+    gateway.face_follow = FaceFollow()
+    gateway.esp32 = Esp32()
+
+    await gateway.stop()
+
+    assert events == ["face_follow_stop", "esp32_stop"]
 
 
 @pytest.mark.asyncio

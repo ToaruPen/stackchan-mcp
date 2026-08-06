@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
+#include <esp_timer.h>
 
 #include "application.h"
 #include "display.h"
@@ -18,6 +19,7 @@
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 #include "camera_stream_protocol.h"
+#include "mcp_message_dispatch.h"
 
 #define TAG "MCP"
 
@@ -402,6 +404,8 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
 }
 
 void McpServer::ParseMessage(const cJSON* json) {
+    const uint64_t received_at_us =
+        static_cast<uint64_t>(esp_timer_get_time());
     // Check JSONRPC version
     auto version = cJSON_GetObjectItem(json, "jsonrpc");
     if (version == nullptr || !cJSON_IsString(version) || strcmp(version->valuestring, "2.0") != 0) {
@@ -479,7 +483,12 @@ void McpServer::ParseMessage(const cJSON* json) {
             ReplyError(id_int, "Invalid arguments");
             return;
         }
-        DoToolCall(id_int, std::string(tool_name->valuestring), tool_arguments);
+        DoToolCall(
+            id_int,
+            std::string(tool_name->valuestring),
+            tool_arguments,
+            received_at_us
+        );
     } else {
         ESP_LOGE(TAG, "Method not implemented: %s", method_str.c_str());
         ReplyError(id_int, "Method not implemented: " + method_str);
@@ -594,7 +603,8 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
 void McpServer::DoToolCall(
     int id,
     const std::string& tool_name,
-    const cJSON* tool_arguments) {
+    const cJSON* tool_arguments,
+    uint64_t received_at_us) {
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 
                                      return tool->name() == tool_name; 
@@ -671,11 +681,32 @@ void McpServer::DoToolCall(
         this,
         id,
         tool_iter,
+        received_at_us,
         arguments = std::move(arguments)
     ]() {
         try {
+            const uint64_t apply_started_at_us =
+                static_cast<uint64_t>(esp_timer_get_time());
             std::string result = (*tool_iter)->Call(arguments);
-            ReplyResultFromMainTask(id, result);
+            const uint64_t apply_finished_at_us =
+                static_cast<uint64_t>(esp_timer_get_time());
+            auto& application = Application::GetInstance();
+            const bool dispatched = stackchan_mcp::DispatchTimedMcpToolResult(
+                id,
+                result,
+                received_at_us,
+                apply_started_at_us,
+                apply_finished_at_us,
+                []() {
+                    return static_cast<uint64_t>(esp_timer_get_time());
+                },
+                [&application](std::string payload) {
+                    application.SendMcpMessageFromMainTask(payload);
+                }
+            );
+            if (!dispatched) {
+                ReplyResultFromMainTask(id, result);
+            }
         } catch (const std::exception& e) {
             ESP_LOGE(TAG, "tools/call: %s", e.what());
             ReplyErrorFromMainTask(id, e.what());

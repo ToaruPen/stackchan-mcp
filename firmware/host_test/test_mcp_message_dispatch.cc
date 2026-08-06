@@ -102,4 +102,67 @@ TEST(McpMessageDispatchTest, WebsocketReplyStillWaitsForTheMainTask) {
             "tools-list-result"}));
 }
 
+TEST(McpMessageDispatchTest, ToolResultCarriesBoundedSameClockStageTiming) {
+    const auto timing = stackchan_mcp::BuildMcpStageTiming(
+        100,
+        200,
+        220,
+        227,
+        1
+    );
+
+    EXPECT_EQ(timing.receive_to_apply_us, 100U);
+    EXPECT_EQ(timing.tool_apply_us, 20U);
+    EXPECT_EQ(timing.apply_to_reply_enqueue_us, 7U);
+    EXPECT_EQ(timing.scheduler_hops, 1U);
+    EXPECT_EQ(
+        stackchan_mcp::AddMcpStageTiming(
+            R"({"content":[],"isError":false})",
+            timing
+        ),
+        R"({"content":[],"isError":false,"mcpStageUs":{"receiveToApply":100,"toolApply":20,"applyToReplyEnqueue":7,"schedulerHops":1}})"
+    );
+}
+
+TEST(McpMessageDispatchTest, StageTimingClampsNonMonotonicClockEdgesToZero) {
+    const auto timing = stackchan_mcp::BuildMcpStageTiming(
+        200,
+        100,
+        90,
+        80,
+        1
+    );
+
+    EXPECT_EQ(timing.receive_to_apply_us, 0U);
+    EXPECT_EQ(timing.tool_apply_us, 0U);
+    EXPECT_EQ(timing.apply_to_reply_enqueue_us, 0U);
+}
+
+TEST(McpMessageDispatchTest, TimedToolReplySamplesAfterPayloadPreparation) {
+    std::vector<std::string> events;
+    std::string sent;
+
+    stackchan_mcp::DispatchTimedMcpToolResult(
+        7,
+        R"({"content":[],"isError":false})",
+        100,
+        200,
+        220,
+        [&events]() {
+            events.push_back("clock");
+            return 227U;
+        },
+        [&events, &sent](std::string payload) {
+            events.push_back("send");
+            sent = std::move(payload);
+        }
+    );
+
+    EXPECT_EQ(events, std::vector<std::string>({"clock", "send"}));
+    EXPECT_EQ(
+        sent,
+        R"({"jsonrpc":"2.0","id":7,"result":{"content":[],"isError":false,"mcpStageUs":{"receiveToApply":100,"toolApply":20,"applyToReplyEnqueue":7,"schedulerHops":1}}})"
+    );
+}
+
 }  // namespace

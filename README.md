@@ -50,6 +50,7 @@ This repository is a monorepo.
 | `get_device_info` | ESP32 device state (battery / volume / WiFi / etc.) | ✅ |
 | `take_photo(question?)` | Capture a frame, save as JPEG, return the path | ✅ |
 | `camera_stream(action, fps?, quality?)` | Reference-count an in-memory latest-JPEG stream (`start` / `stop` / `status`). No frame is written to disk. | ✅ |
+| `stackchan_face_follow(action)` | Start, inspect, or stop gateway-owned face follow (`start` / `status` / `stop`). Camera frames, PINTO inference, the controller, and the latest-only head lane stay inside `stackchan-mcp`; the MCP host does not embed them. Requires the `[face-follow]` extra and `STACKCHAN_FACE_FOLLOW_MODEL`. | ✅ |
 | `set_volume(volume)` | Speaker volume (0-100) | ✅ |
 | `set_brightness(brightness)` | Screen brightness (0-100) | ✅ |
 | `move_head(yaw, pitch, speed?)` | Move the neck (servos). `pitch` is constrained to `5..85` — the M5Stack-recommended operating range. For the wider firmware hard clamp (`0..88`), use the firmware-side `set_head_angles` device tool instead. | ✅ |
@@ -387,7 +388,8 @@ If you installed via `pip install stackchan-mcp`:
       "command": "stackchan-mcp",
       "env": {
         "STACKCHAN_TOKEN": "your-secret-token-here",
-        "VISION_HOST": "your.host.lan.ip"
+        "VISION_HOST": "your.host.lan.ip",
+        "STACKCHAN_FACE_FOLLOW_MODEL": "/absolute/path/to/model.onnx"
       }
     }
   }
@@ -405,13 +407,35 @@ If you installed from source via `uv`:
       "args": [
         "run", "--directory", "/path/to/stackchan-mcp/gateway",
         "python", "-m", "stackchan_mcp"
-      ]
+      ],
+      "env": {
+        "STACKCHAN_FACE_FOLLOW_MODEL": "/absolute/path/to/model.onnx"
+      }
     }
   }
 }
 ```
 
 See `gateway/README.md` for details.
+
+### Optional face-follow setup
+
+Install the gateway with its local inference dependencies and point it at an
+existing PINTO head/face ONNX model:
+
+```bash
+uv tool install 'stackchan-mcp[face-follow]'
+export STACKCHAN_FACE_FOLLOW_MODEL=/absolute/path/to/model.onnx
+```
+
+The gateway does not download a model or select a fallback automatically.
+GUI-launched MCP hosts may not inherit variables exported by your shell, so
+pass `STACKCHAN_FACE_FOLLOW_MODEL` in the MCP server's `env` block as shown
+above.
+Any MCP host, including Moco, only registers `stackchan-mcp` as an MCP server
+and calls `stackchan_face_follow(action="start" | "status" | "stop")`; it does
+not need camera, ONNX, or controller code of its own. Frames remain in bounded
+gateway memory and are not written to disk by face follow.
 
 ### Gateway user-defaults TOML file
 

@@ -544,7 +544,14 @@ class ESP32Manager:
         self._camera_datagram_port = 0
         self._camera_datagram_host = ""
         self._camera_datagram_sessions: dict[bytes, CameraDatagramSession] = {}
-        self._last_camera_datagram_status: dict[str, int | bool] = {
+        empty_camera_histogram = {
+            "count": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+        }
+        self._last_camera_datagram_status: dict[str, Any] = {
             "ready": False,
             "pending": False,
             "completed_frames": 0,
@@ -553,6 +560,8 @@ class ESP32Manager:
             "expired_frames": 0,
             "invalid_frames": 0,
             "source_mismatch_packets": 0,
+            "assembly_ms": dict(empty_camera_histogram),
+            "completed_interval_ms": dict(empty_camera_histogram),
         }
         self._camera_credit_task: asyncio.Task[None] | None = None
         self._camera_frame_tasks: set[asyncio.Task[None]] = set()
@@ -913,7 +922,7 @@ class ESP32Manager:
                 self._camera_ready_pair = None
         await media.close()
 
-    def camera_datagram_status(self) -> dict[str, int | bool]:
+    def camera_datagram_status(self) -> dict[str, Any]:
         media = self._camera_connection
         if (
             media is not None

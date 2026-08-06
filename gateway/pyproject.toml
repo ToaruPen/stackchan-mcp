@@ -95,6 +95,14 @@ stt-openai = [
     "openai>=1.0",
 ]
 
+# Gateway-owned face follow. These are imported lazily only when
+# stackchan_face_follow(action="start") loads a configured PINTO model.
+face-follow = [
+    "numpy>=1.26",
+    "onnxruntime>=1.20",
+    "Pillow>=10.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/kisaragi-mochi/stackchan-mcp"
 Repository = "https://github.com/kisaragi-mochi/stackchan-mcp"

@@ -378,6 +378,87 @@ async def test_list_tools_includes_camera_stream_lifecycle_schema():
 
 
 @pytest.mark.asyncio
+async def test_list_tools_includes_gateway_owned_face_follow_lifecycle_schema():
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tools = {tool.name: tool for tool in result.root.tools}
+    follow = tools["stackchan_face_follow"]
+    assert follow.inputSchema == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "status", "stop"],
+            }
+        },
+        "required": ["action"],
+    }
+    assert "gateway" in follow.description
+    assert "MCP" in follow.description
+
+
+@pytest.mark.asyncio
+async def test_face_follow_tool_routes_only_strict_lifecycle_actions(monkeypatch):
+    calls: list[str] = []
+
+    class FaceFollow:
+        async def start(self):
+            calls.append("start")
+            return {"phase": "running"}
+
+        def status(self):
+            calls.append("status")
+            return {"phase": "running"}
+
+        async def stop(self):
+            calls.append("stop")
+            return {"phase": "stopped"}
+
+    class Gateway:
+        face_follow = FaceFollow()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: Gateway())
+    server = create_server()
+
+    responses = []
+    for action in ("start", "status", "stop"):
+        result = await server.request_handlers[CallToolRequest](
+            CallToolRequest(
+                method="tools/call",
+                params={
+                    "name": "stackchan_face_follow",
+                    "arguments": {"action": action},
+                },
+            )
+        )
+        responses.append(json.loads(result.root.content[0].text))
+
+    invalid = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={
+                "name": "stackchan_face_follow",
+                "arguments": {"action": "status", "model_path": "/tmp/model"},
+            },
+        )
+    )
+
+    assert calls == ["start", "status", "stop"]
+    assert [item["phase"] for item in responses] == [
+        "running",
+        "running",
+        "stopped",
+    ]
+    assert "Additional properties are not allowed" in invalid.root.content[0].text
+    assert "model_path" in invalid.root.content[0].text
+
+
+@pytest.mark.asyncio
 async def test_list_tools_includes_head_target_lane_schema():
     server = create_server()
 

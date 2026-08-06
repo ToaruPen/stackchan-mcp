@@ -14,6 +14,7 @@ import logging
 import time
 from typing import Any, Protocol
 
+from .camera_metrics import BoundedLatencyHistogram
 from .wifi_power_save import acquire_wifi_power_save, release_wifi_power_save
 
 
@@ -41,6 +42,9 @@ class CameraFrame:
     height: int
     quality: int
     jpeg: bytes
+    capture_wait_us: int | None = None
+    encode_us: int | None = None
+    received_monotonic_ms: int | None = None
     gateway_sequence: int = 0
 
 
@@ -49,6 +53,7 @@ def parse_camera_frame(
     *,
     max_frame_bytes: int,
     received_at_ms: int | None = None,
+    received_monotonic_ms: int | None = None,
 ) -> CameraFrame | None:
     """Parse one SCL1 camera frame, returning ``None`` for non-camera binary."""
     if not payload.startswith(_SCL1_MAGIC):
@@ -100,6 +105,16 @@ def parse_camera_frame(
         "deviceEncodedAtMs",
         minimum=captured_at_ms,
     )
+    capture_wait_us = _optional_integer(
+        header_value,
+        "deviceCaptureWaitUs",
+        minimum=0,
+    )
+    encode_us = _optional_integer(
+        header_value,
+        "deviceEncodeUs",
+        minimum=0,
+    )
     width = _required_integer(header_value, "width", minimum=1)
     height = _required_integer(header_value, "height", minimum=1)
     quality = _required_integer(header_value, "quality", minimum=1, maximum=100)
@@ -125,6 +140,13 @@ def parse_camera_frame(
         height=height,
         quality=quality,
         jpeg=jpeg,
+        capture_wait_us=capture_wait_us,
+        encode_us=encode_us,
+        received_monotonic_ms=(
+            received_monotonic_ms
+            if received_monotonic_ms is not None
+            else time.monotonic_ns() // 1_000_000
+        ),
     )
 
 
@@ -143,6 +165,17 @@ def _required_integer(
     return value
 
 
+def _optional_integer(
+    values: dict[str, Any],
+    name: str,
+    *,
+    minimum: int,
+) -> int | None:
+    if name not in values:
+        return None
+    return _required_integer(values, name, minimum=minimum)
+
+
 class LatestCameraFrameStore:
     """Keep only the newest camera frame and bounded aggregate counters."""
 
@@ -155,6 +188,25 @@ class LatestCameraFrameStore:
         self._replaced_frames = 0
         self._stale_frames = 0
         self._max_jpeg_bytes = 0
+        self._previous_captured_at_ms: int | None = None
+        self._previous_received_monotonic_ms: int | None = None
+        self._device_capture_interval_ms = BoundedLatencyHistogram(
+            maximum_bucket=30_000
+        )
+        self._device_capture_wait_us = BoundedLatencyHistogram(
+            maximum_bucket=10_000_000
+        )
+        self._device_encode_us = BoundedLatencyHistogram(
+            maximum_bucket=10_000_000
+        )
+        self._gateway_receive_interval_ms = BoundedLatencyHistogram(
+            maximum_bucket=30_000
+        )
+        self._latest_wait_ms = BoundedLatencyHistogram(maximum_bucket=30_000)
+        self._wait_calls = 0
+        self._immediate_deliveries = 0
+        self._waited_deliveries = 0
+        self._wait_timeouts = 0
 
     async def publish(self, frame: CameraFrame) -> bool:
         """Adopt ``frame`` when it is newer than the current generation."""
@@ -178,6 +230,29 @@ class LatestCameraFrameStore:
             self._latest_device_sequence = frame.sequence
             self._received_frames += 1
             self._max_jpeg_bytes = max(self._max_jpeg_bytes, len(frame.jpeg))
+            if (
+                self._previous_captured_at_ms is not None
+                and frame.captured_at_ms >= self._previous_captured_at_ms
+            ):
+                self._device_capture_interval_ms.add(
+                    frame.captured_at_ms - self._previous_captured_at_ms
+                )
+            if (
+                self._previous_received_monotonic_ms is not None
+                and frame.received_monotonic_ms is not None
+                and frame.received_monotonic_ms
+                >= self._previous_received_monotonic_ms
+            ):
+                self._gateway_receive_interval_ms.add(
+                    frame.received_monotonic_ms
+                    - self._previous_received_monotonic_ms
+                )
+            self._previous_captured_at_ms = frame.captured_at_ms
+            self._previous_received_monotonic_ms = frame.received_monotonic_ms
+            if frame.capture_wait_us is not None:
+                self._device_capture_wait_us.add(frame.capture_wait_us)
+            if frame.encode_us is not None:
+                self._device_encode_us.add(frame.encode_us)
             self._condition.notify_all()
             return True
 
@@ -188,10 +263,18 @@ class LatestCameraFrameStore:
         timeout_s: float,
     ) -> CameraFrame | None:
         """Return a newer frame immediately or after a bounded wait."""
+        started_at = time.monotonic()
         async with self._condition:
+            self._wait_calls += 1
             frame = self._matching_frame(after_sequence)
-            if frame is not None or timeout_s <= 0:
+            if frame is not None:
+                self._immediate_deliveries += 1
+                self._latest_wait_ms.add((time.monotonic() - started_at) * 1_000)
                 return frame
+            if timeout_s <= 0:
+                self._wait_timeouts += 1
+                self._latest_wait_ms.add((time.monotonic() - started_at) * 1_000)
+                return None
             try:
                 await asyncio.wait_for(
                     self._condition.wait_for(
@@ -200,17 +283,27 @@ class LatestCameraFrameStore:
                     timeout=timeout_s,
                 )
             except asyncio.TimeoutError:
+                self._wait_timeouts += 1
+                self._latest_wait_ms.add((time.monotonic() - started_at) * 1_000)
                 return None
-            return self._matching_frame(after_sequence)
+            frame = self._matching_frame(after_sequence)
+            if frame is not None:
+                self._waited_deliveries += 1
+            else:
+                self._wait_timeouts += 1
+            self._latest_wait_ms.add((time.monotonic() - started_at) * 1_000)
+            return frame
 
     async def clear(self) -> None:
         """Discard the retained JPEG while preserving aggregate counters."""
         async with self._condition:
             self._latest = None
             self._latest_device_sequence = None
+            self._previous_captured_at_ms = None
+            self._previous_received_monotonic_ms = None
             self._condition.notify_all()
 
-    def status(self) -> dict[str, int | bool | None]:
+    def status(self) -> dict[str, Any]:
         """Return image-free status suitable for diagnostics."""
         latest = self._latest
         return {
@@ -220,6 +313,23 @@ class LatestCameraFrameStore:
             "replaced_frames": self._replaced_frames,
             "stale_frames": self._stale_frames,
             "max_jpeg_bytes": self._max_jpeg_bytes,
+            "timing": {
+                "device_capture_interval_ms": (
+                    self._device_capture_interval_ms.status()
+                ),
+                "device_capture_wait_us": self._device_capture_wait_us.status(),
+                "device_encode_us": self._device_encode_us.status(),
+                "gateway_receive_interval_ms": (
+                    self._gateway_receive_interval_ms.status()
+                ),
+                "latest_wait_ms": self._latest_wait_ms.status(),
+            },
+            "wait": {
+                "calls": self._wait_calls,
+                "immediate_deliveries": self._immediate_deliveries,
+                "waited_deliveries": self._waited_deliveries,
+                "timeouts": self._wait_timeouts,
+            },
         }
 
     def _matching_frame(self, after_sequence: int | None) -> CameraFrame | None:
@@ -249,7 +359,7 @@ class CameraStreamDevice(Protocol):
 
     async def end_camera_datagram_stream(self) -> None: ...
 
-    def camera_datagram_status(self) -> dict[str, int | bool]: ...
+    def camera_datagram_status(self) -> dict[str, Any]: ...
 
 
 class CameraStreamService:

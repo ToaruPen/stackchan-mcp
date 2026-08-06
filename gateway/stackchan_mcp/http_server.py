@@ -35,6 +35,7 @@ BYPASS_TOOLS = frozenset(
         "camera_stream",
         "stackchan_follow_pose_stream",
         "stackchan_head_target_lane",
+        "stackchan_face_follow",
     }
 )
 MCP_HTTP_ALLOWED_HOSTS_ENV = "MCP_HTTP_ALLOWED_HOSTS"

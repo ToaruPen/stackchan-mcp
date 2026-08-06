@@ -53,6 +53,7 @@ private:
     std::atomic<uint32_t> camera_stream_sequence_{0};
     std::atomic<uint32_t> camera_stream_frames_{0};
     std::atomic<uint32_t> camera_stream_encode_failures_{0};
+    std::atomic<uint32_t> camera_stream_no_credit_drops_{0};
     std::atomic<int> camera_stream_fps_{0};
     std::atomic<int> camera_stream_quality_{0};
     std::atomic<CameraStreamWorkerStage> camera_stream_stage_{
