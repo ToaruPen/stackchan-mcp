@@ -3,6 +3,7 @@
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,7 +240,7 @@ def _notify_config(*, legacy: bool = False) -> NotifyConfig:
 
 
 class _FakeWebSocket:
-    request = None
+    request = SimpleNamespace(headers={"Device-Id": "device-test"})
 
     def __init__(self, messages):
         self._messages = list(messages)

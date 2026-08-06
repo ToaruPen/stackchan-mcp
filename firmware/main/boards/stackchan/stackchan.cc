@@ -32,6 +32,8 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include "avatar_images.h"
 #include "avatar_set.h"
 #include "avatar_set_fetcher.h"
+#include "head_spring_motion.h"
+#include "stackchan_auto_sleep_control.h"
 
 #include <smooth_ui_toolkit.hpp>
 #include <esp_log.h>
@@ -44,6 +46,7 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
 #include <esp_random.h>
+#include <nvs.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -510,6 +513,7 @@ private:
     // External I2C bus dedicated to Grove Port A. Exposed through self.i2c.*
     // MCP tools so the gateway can drive attached M5Stack Unit modules.
     i2c_master_bus_handle_t port_a_i2c_bus_;
+
     // Port B WS2812 generic strip state (driven from MCP tools self.port_b.ws2812.*).
     // Independent from the on-board PY32-driven 12-LED base strip (self.led.*),
     // which uses I2C -> PY32 internal WS2812 engine. The two paths share no
@@ -775,6 +779,7 @@ private:
         bool position_unknown = false;
     };
     class MotionDriver;
+    class HostInterpolationMotionDriver;
     // TODO: motion_mutex_/scs_bus_mutex_/servo_task_handle_ have no destroy path; board is singleton via DECLARE_BOARD.
     AxisMotion yaw_motion_;
     AxisMotion pitch_motion_;
@@ -1161,6 +1166,10 @@ private:
         // True iff at least one axis is currently in motion.
         virtual bool IsMoving() const = 0;
 
+        // Caller holds motion_mutex_. Host interpolation also waits for its
+        // exact terminal write; delegated motion has no extra terminal state.
+        virtual bool IsIdleLocked() const = 0;
+
         // Called from ServoTask body at a driver-dependent cadence.
         virtual void Tick() = 0;
 
@@ -1207,12 +1216,21 @@ private:
             pitch_anim_.teleport(static_cast<float>(pitch_motion_.current_deg));
         }
 
+        bool IsIdleLocked() const override {
+            return !yaw_motion_.moving && !pitch_motion_.moving &&
+                   !yaw_snap_on_rest_ && !pitch_snap_on_rest_;
+        }
+
         void StartMove(float yaw_deg, float pitch_deg,
                        uint32_t duration_ms,
                        bool prefer_linear) override {
             uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
             int yaw = static_cast<int>(yaw_deg);
             int pitch = static_cast<int>(pitch_deg);
+            bool yaw_was_spring_moving =
+                yaw_motion_.moving && !yaw_linear_mode_;
+            bool pitch_was_spring_moving =
+                pitch_motion_.moving && !pitch_linear_mode_;
 
             yaw_motion_.request_token = ++next_request_token_;
             yaw_motion_.target_deg = yaw;
@@ -1239,12 +1257,14 @@ private:
 
             smooth_ui_toolkit::SpringOptions_t spring_options =
                 MapDurationToSpringOptions(duration_ms);
-            StartAxisSpring(yaw_anim_, yaw_snap_on_rest_,
-                            yaw_motion_.current_deg, yaw,
-                            yaw_motion_.moving, spring_options);
-            StartAxisSpring(pitch_anim_, pitch_snap_on_rest_,
-                            pitch_motion_.current_deg, pitch,
-                            pitch_motion_.moving, spring_options);
+            stackchan_motion::StartOrRetargetAxisSpring(
+                yaw_anim_, yaw_snap_on_rest_,
+                yaw_motion_.current_deg, yaw, yaw_motion_.moving,
+                yaw_was_spring_moving, spring_options);
+            stackchan_motion::StartOrRetargetAxisSpring(
+                pitch_anim_, pitch_snap_on_rest_,
+                pitch_motion_.current_deg, pitch, pitch_motion_.moving,
+                pitch_was_spring_moving, spring_options);
         }
 
         float GetYawDeg() const override {
@@ -1276,11 +1296,19 @@ private:
             AxisMotion yaw_local;
             AxisMotion pitch_local;
             int new_yaw_current;
+            float new_yaw_write_deg;
             bool new_yaw_moving;
             int new_pitch_current;
+            float new_pitch_write_deg;
             bool new_pitch_moving;
             bool yaw_linear_mode;
             bool pitch_linear_mode;
+            bool yaw_final_native_write;
+            bool pitch_final_native_write;
+            bool yaw_write_succeeded = false;
+            bool pitch_write_succeeded = false;
+            NativeWriteOutcome yaw_write_outcome;
+            NativeWriteOutcome pitch_write_outcome;
             uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
             float dt_s;
             // Spring mode follows real elapsed time so bus ACK latency or
@@ -1302,7 +1330,12 @@ private:
             pitch_local = pitch_motion_;
             yaw_linear_mode = yaw_linear_mode_;
             pitch_linear_mode = pitch_linear_mode_;
-            if (!yaw_local.moving && !pitch_local.moving) {
+            yaw_final_native_write =
+                !yaw_local.moving && yaw_snap_on_rest_;
+            pitch_final_native_write =
+                !pitch_local.moving && pitch_snap_on_rest_;
+            if (!yaw_local.moving && !pitch_local.moving
+                && !yaw_final_native_write && !pitch_final_native_write) {
                 xSemaphoreGive(motion_mutex_);
                 return;
             }
@@ -1311,48 +1344,101 @@ private:
             if (yaw_linear_mode) {
                 AdvanceAxisLinear(yaw_local, now_ms,
                                   new_yaw_current, new_yaw_moving);
+                new_yaw_write_deg = static_cast<float>(new_yaw_current);
             } else {
-                AdvanceAxisSpring(yaw_local, yaw_anim_, yaw_snap_on_rest_,
-                                  dt_s, new_yaw_current, new_yaw_moving);
+                stackchan_motion::AdvanceAxisSpring(
+                    yaw_anim_, yaw_snap_on_rest_, dt_s,
+                    new_yaw_current, new_yaw_moving);
+                new_yaw_write_deg = yaw_anim_.directValue();
             }
             new_pitch_current = pitch_local.current_deg;
             new_pitch_moving = pitch_local.moving;
             if (pitch_linear_mode) {
                 AdvanceAxisLinear(pitch_local, now_ms,
                                   new_pitch_current, new_pitch_moving);
+                new_pitch_write_deg = static_cast<float>(new_pitch_current);
             } else {
-                AdvanceAxisSpring(pitch_local, pitch_anim_, pitch_snap_on_rest_,
-                                  dt_s, new_pitch_current, new_pitch_moving);
+                stackchan_motion::AdvanceAxisSpring(
+                    pitch_anim_, pitch_snap_on_rest_, dt_s,
+                    new_pitch_current, new_pitch_moving);
+                new_pitch_write_deg = pitch_anim_.directValue();
             }
             xSemaphoreGive(motion_mutex_);
 
-            // Known carve-out (#161): motion_mutex_ is released here
-            // and re-acquired after the WritePos block. If StartMove
-            // or InvalidateAxisToken (Phase 0' / torque disable) fires
-            // inside this release window, the WritePos calls below
-            // still send a stale interpolation step on the bus. The
-            // post-bus request_token guard below then correctly skips
-            // the current_deg / moving commit, but the physical
-            // intermediate position has already been issued. The
-            // pre-PR move_start_ms guard had the same surface; this PR
-            // does not regress that behavior. Closing the pre-bus gate
-            // is tracked separately under #161.
+            // Keep bus serialization through the two physical frames, but
+            // hold motion_mutex_ only for each freshness read. WritePos can
+            // block on a servo ACK; retaining the motion lock across it would
+            // delay StartMove and turn latest-target following into stop-go
+            // motion. A matching freshness read reserves at most this one bus
+            // frame. A later retarget can make that reserved frame stale, but
+            // the request-token commit below rejects its state and the next
+            // freshness gate sends the latest target.
             xSemaphoreTake(scs_bus_mutex_, portMAX_DELAY);
-            if (yaw_local.moving) {
-                int yaw_pos = YawDegToPos(new_yaw_current);
-                int r = scs_bus_.WritePos(SERVO_YAW_ID, yaw_pos, MOTION_PER_WRITE_TIME_MS, 0);
-                if (!ServoWritePosOk(r)) {
-                    ESP_LOGW(TAG, "Motion yaw WritePos failed: r=%d (deg=%d, pos=%d)",
-                             r, new_yaw_current, yaw_pos);
+            if (yaw_local.moving || yaw_final_native_write) {
+                int yaw_pos = yaw_linear_mode
+                    ? YawDegToPos(new_yaw_current)
+                    : stackchan_motion::RoundedNativePosition(
+                          stackchan_motion::SelectSpringFrameDegrees(
+                              new_yaw_write_deg,
+                              yaw_local.target_deg,
+                              yaw_final_native_write),
+                          460, 0, 1000);
+                bool yaw_frame_wrote =
+                    stackchan_motion::WriteHeadSpringFrameIfFresh(
+                        yaw_local.request_token,
+                        [&] {
+                            xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+                            const uint64_t token =
+                                yaw_motion_.request_token;
+                            xSemaphoreGive(motion_mutex_);
+                            return token;
+                        },
+                        [&] {
+                            yaw_write_outcome = WriteNativePosition(
+                                SERVO_YAW_ID, yaw_pos);
+                        });
+                if (yaw_frame_wrote) {
+                    yaw_write_succeeded =
+                        yaw_write_outcome.ack_succeeded;
+                    if (!yaw_write_succeeded) {
+                        ESP_LOGW(TAG, "Motion yaw WritePos failed: r=%d (deg=%d, pos=%d)",
+                                 yaw_write_outcome.bus_result,
+                                 new_yaw_current, yaw_pos);
+                    }
                 }
             }
             vTaskDelay(kInterFrameGap);
-            if (pitch_local.moving) {
-                int pitch_pos = PitchDegToPos(new_pitch_current);
-                int r = scs_bus_.WritePos(SERVO_PITCH_ID, pitch_pos, MOTION_PER_WRITE_TIME_MS, 0);
-                if (!ServoWritePosOk(r)) {
-                    ESP_LOGW(TAG, "Motion pitch WritePos failed: r=%d (deg=%d, pos=%d)",
-                             r, new_pitch_current, pitch_pos);
+            if (pitch_local.moving || pitch_final_native_write) {
+                int pitch_pos = pitch_linear_mode
+                    ? PitchDegToPos(new_pitch_current)
+                    : stackchan_motion::RoundedNativePosition(
+                          stackchan_motion::SelectSpringFrameDegrees(
+                              new_pitch_write_deg,
+                              pitch_local.target_deg,
+                              pitch_final_native_write),
+                          620, 620, 901);
+                bool pitch_frame_wrote =
+                    stackchan_motion::WriteHeadSpringFrameIfFresh(
+                        pitch_local.request_token,
+                        [&] {
+                            xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+                            const uint64_t token =
+                                pitch_motion_.request_token;
+                            xSemaphoreGive(motion_mutex_);
+                            return token;
+                        },
+                        [&] {
+                            pitch_write_outcome = WriteNativePosition(
+                                SERVO_PITCH_ID, pitch_pos);
+                        });
+                if (pitch_frame_wrote) {
+                    pitch_write_succeeded =
+                        pitch_write_outcome.ack_succeeded;
+                    if (!pitch_write_succeeded) {
+                        ESP_LOGW(TAG, "Motion pitch WritePos failed: r=%d (deg=%d, pos=%d)",
+                                 pitch_write_outcome.bus_result,
+                                 new_pitch_current, pitch_pos);
+                    }
                 }
             }
             xSemaphoreGive(scs_bus_mutex_);
@@ -1360,6 +1446,10 @@ private:
             xSemaphoreTake(motion_mutex_, portMAX_DELAY);
             if (yaw_motion_.request_token == yaw_local.request_token) {
                 yaw_motion_.current_deg = new_yaw_current;
+                if (stackchan_motion::ShouldClearFinalNativeWrite(
+                        yaw_final_native_write, yaw_write_succeeded)) {
+                    yaw_snap_on_rest_ = false;
+                }
             }
             if (!new_yaw_moving && yaw_motion_.target_deg == yaw_local.target_deg
                 && yaw_motion_.request_token == yaw_local.request_token) {
@@ -1367,6 +1457,10 @@ private:
             }
             if (pitch_motion_.request_token == pitch_local.request_token) {
                 pitch_motion_.current_deg = new_pitch_current;
+                if (stackchan_motion::ShouldClearFinalNativeWrite(
+                        pitch_final_native_write, pitch_write_succeeded)) {
+                    pitch_snap_on_rest_ = false;
+                }
             }
             if (!new_pitch_moving && pitch_motion_.target_deg == pitch_local.target_deg
                 && pitch_motion_.request_token == pitch_local.request_token) {
@@ -1384,51 +1478,24 @@ private:
         void InvalidateAxisToken(int axis_id) override {
             if (axis_id == SERVO_YAW_ID) {
                 yaw_motion_.request_token = ++next_request_token_;
+                yaw_snap_on_rest_ = false;
             } else if (axis_id == SERVO_PITCH_ID) {
                 pitch_motion_.request_token = ++next_request_token_;
+                pitch_snap_on_rest_ = false;
             }
         }
 
     private:
-        static void StartAxisSpring(
-            smooth_ui_toolkit::AnimateValue& axis_anim,
-            bool& snap_on_rest,
-            int current_deg,
-            int target_deg,
-            bool moving,
-            const smooth_ui_toolkit::SpringOptions_t& spring_options) {
-            if (!moving) {
-                axis_anim.teleport(static_cast<float>(current_deg));
-                snap_on_rest = false;
-                return;
-            }
+        struct NativeWriteOutcome {
+            bool ack_succeeded = false;
+            int bus_result = 0;
+        };
 
-            axis_anim.springOptions() = spring_options;
-            axis_anim.teleport(static_cast<float>(current_deg));
-            axis_anim = static_cast<float>(target_deg);
-            snap_on_rest = true;
-        }
-
-        static void AdvanceAxisSpring(
-            const AxisMotion& axis_local,
-            smooth_ui_toolkit::AnimateValue& axis_anim,
-            bool& snap_on_rest,
-            float dt_s,
-            int& new_current_deg,
-            bool& new_moving) {
-            if (!axis_local.moving) {
-                return;
-            }
-
-            axis_anim.updateWithDelta(dt_s);
-            new_current_deg = static_cast<int>(axis_anim.directValue());
-            if (axis_anim.done()) {
-                new_moving = false;
-                if (snap_on_rest) {
-                    new_current_deg = static_cast<int>(axis_anim.end);
-                    snap_on_rest = false;
-                }
-            }
+        NativeWriteOutcome WriteNativePosition(int axis_id, int position) {
+            const int result = scs_bus_.WritePos(
+                axis_id, position, MOTION_PER_WRITE_TIME_MS, 0);
+            const bool ack_succeeded = ServoWritePosOk(result);
+            return {ack_succeeded, result};
         }
 
         static void AdvanceAxisLinear(
@@ -1581,6 +1648,10 @@ private:
             bool moving = yaw_motion_.moving || pitch_motion_.moving;
             xSemaphoreGive(motion_mutex_);
             return moving;
+        }
+
+        bool IsIdleLocked() const override {
+            return !yaw_motion_.moving && !pitch_motion_.moving;
         }
 
         void Tick() override {
@@ -2126,8 +2197,17 @@ private:
         AxisServo pitch_axis_;
     };
 
+    bool MotionAndFinalWriteIdleLocked() const {
+        if (motion_driver_ != nullptr) {
+            return motion_driver_->IsIdleLocked();
+        }
+        return !yaw_motion_.moving && !pitch_motion_.moving;
+    }
+
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_ = new PowerSaveTimer(
+            -1, stackchan_power::kAutoSleepAfterSeconds,
+            stackchan_power::kAutoShutdownAfterSeconds);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
@@ -2140,6 +2220,94 @@ private:
             pmic_->PowerOff();
         });
         power_save_timer_->SetEnabled(true);
+    }
+
+    stackchan_power::AutoSleepPersistenceRead ReadAutoSleepPolicyFromNvs() {
+        nvs_handle_t handle = 0;
+        esp_err_t err = nvs_open("wifi", NVS_READONLY, &handle);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            return {
+                .status =
+                    stackchan_power::AutoSleepPersistenceStatus::kMissing,
+            };
+        }
+        if (err != ESP_OK) {
+            return {
+                .status = stackchan_power::AutoSleepPersistenceStatus::kError,
+                .error = std::string("Failed to open wifi NVS: ") +
+                         esp_err_to_name(err),
+            };
+        }
+
+        uint8_t value = 0;
+        err = nvs_get_u8(handle, "sleep_mode", &value);
+        nvs_close(handle);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            return {
+                .status =
+                    stackchan_power::AutoSleepPersistenceStatus::kMissing,
+            };
+        }
+        if (err != ESP_OK) {
+            return {
+                .status = stackchan_power::AutoSleepPersistenceStatus::kError,
+                .error = std::string("Failed to read wifi.sleep_mode: ") +
+                         esp_err_to_name(err),
+            };
+        }
+        return {
+            .status = stackchan_power::AutoSleepPersistenceStatus::kOk,
+            .enabled = value != 0,
+        };
+    }
+
+    stackchan_power::AutoSleepPersistenceWrite WriteAutoSleepPolicyToNvs(
+        bool enabled) {
+        nvs_handle_t handle = 0;
+        esp_err_t err = nvs_open("wifi", NVS_READWRITE, &handle);
+        if (err != ESP_OK) {
+            return {
+                .ok = false,
+                .error = std::string("Failed to open wifi NVS for writing: ") +
+                         esp_err_to_name(err),
+            };
+        }
+
+        err = nvs_set_u8(handle, "sleep_mode", enabled ? 1 : 0);
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
+        nvs_close(handle);
+        if (err != ESP_OK) {
+            return {
+                .ok = false,
+                .error = std::string("Failed to persist wifi.sleep_mode: ") +
+                         esp_err_to_name(err),
+            };
+        }
+        return {.ok = true};
+    }
+
+    stackchan_power::AutoSleepControlHooks AutoSleepControlHooks() {
+        return {
+            .context = this,
+            .read = [](void* context) {
+                return static_cast<StackChanBoard*>(context)
+                    ->ReadAutoSleepPolicyFromNvs();
+            },
+            .write = [](void* context, bool enabled) {
+                return static_cast<StackChanBoard*>(context)
+                    ->WriteAutoSleepPolicyToNvs(enabled);
+            },
+            .set_timer_enabled = [](void* context, bool enabled) {
+                static_cast<StackChanBoard*>(context)
+                    ->power_save_timer_->SetEnabled(enabled);
+            },
+            .wake_up = [](void* context) {
+                static_cast<StackChanBoard*>(context)
+                    ->power_save_timer_->WakeUp();
+            },
+        };
     }
 
     void InitializeI2c() {
@@ -3879,6 +4047,10 @@ private:
             servo_wobble_active_.store(false);
             servo_wobble_step_.store(0);
         }
+        duration_ms = stackchan_motion::EnsurePositionRecoveryDurationMs(
+            duration_ms,
+            yaw_motion_.position_unknown || pitch_motion_.position_unknown,
+            MOTION_DEFAULT_DURATION_MS);
         motion_driver_->StartMove(yaw_deg, pitch_deg, duration_ms,
                                   prefer_linear);
         xSemaphoreGive(motion_mutex_);
@@ -5625,12 +5797,53 @@ private:
         mcp_server.AddTool(
             "self.robot.get_head_angles",
             "Get the current head angles (yaw, pitch) of the robot in degrees. "
+            "When cached_motion_state=true, avoid servo-bus I/O and return "
+            "the host interpolator's current/target angles and moving flag "
+            "for high-rate motion diagnostics. "
             "Returns {\"yaw\":N,\"pitch\":N} on success; "
             "on persistent ReadPos failure returns "
             "{\"yaw\":null,\"pitch\":null,\"error\":...,\"servo_ok\":bool,"
             "\"yaw_attempts\":N,\"pitch_attempts\":N}.",
-            PropertyList(),
+            PropertyList({
+                Property("cached_motion_state",
+                         kPropertyTypeBoolean, false),
+            }),
             [this](const PropertyList& properties) -> ReturnValue {
+                if (properties["cached_motion_state"].value<bool>()) {
+                    if (!servo_ok_) {
+                        cJSON* root = cJSON_CreateObject();
+                        cJSON_AddNullToObject(root, "yaw");
+                        cJSON_AddNullToObject(root, "pitch");
+                        cJSON_AddStringToObject(
+                            root, "error", "Servo bus is unavailable");
+                        cJSON_AddBoolToObject(root, "servo_ok", false);
+                        cJSON_AddNumberToObject(root, "yaw_attempts", 0);
+                        cJSON_AddNumberToObject(root, "pitch_attempts", 0);
+                        return root;
+                    }
+                    int yaw = 0;
+                    int pitch = 0;
+                    int target_yaw = 0;
+                    int target_pitch = 0;
+                    bool moving = false;
+                    xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+                    yaw = yaw_motion_.current_deg;
+                    pitch = pitch_motion_.current_deg;
+                    target_yaw = yaw_motion_.target_deg;
+                    target_pitch = pitch_motion_.target_deg;
+                    moving = yaw_motion_.moving || pitch_motion_.moving;
+                    xSemaphoreGive(motion_mutex_);
+
+                    cJSON* root = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(root, "yaw", yaw);
+                    cJSON_AddNumberToObject(root, "pitch", pitch);
+                    cJSON_AddNumberToObject(root, "target_yaw", target_yaw);
+                    cJSON_AddNumberToObject(root, "target_pitch",
+                                            target_pitch);
+                    cJSON_AddBoolToObject(root, "moving", moving);
+                    return root;
+                }
+
                 // Issue #123: retry ReadPos a few times before falling back
                 // to an explicit error reply. Single-call ReadPos failures
                 // (e.g. servo mid-motion, transient bus contention) are a
@@ -5759,6 +5972,29 @@ private:
             });
 
         mcp_server.AddTool(
+            "self.robot.get_auto_torque_release",
+            "Read the current automatic SCS0009 torque-release setting and "
+            "published torque state without servo-bus I/O.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(
+                    root, "enabled",
+                    auto_release_enabled_.load(std::memory_order_acquire));
+                cJSON_AddNumberToObject(
+                    root, "timeout_ms",
+                    auto_release_timeout_ms_.load(std::memory_order_acquire));
+                cJSON_AddNumberToObject(
+                    root, "torque_state",
+                    static_cast<int>(
+                        torque_state_.load(std::memory_order_acquire)));
+                cJSON_AddNumberToObject(
+                    root, "torque_release_epoch",
+                    torque_release_epoch_.load(std::memory_order_acquire));
+                return root;
+            });
+
+        mcp_server.AddTool(
             "self.robot.set_auto_torque_release",
             "Enable or disable automatic SCS0009 torque release after "
             "motion idle timeout. timeout_ms is clamped by the firmware "
@@ -5800,6 +6036,10 @@ private:
                 bool torque_released_at_call =
                     torque_state_.load(std::memory_order_acquire) ==
                     TorqueState::kReleased;
+                const bool previous_enabled =
+                    auto_release_enabled_.load(std::memory_order_acquire);
+                const uint32_t previous_timeout_ms =
+                    auto_release_timeout_ms_.load(std::memory_order_acquire);
                 auto_release_timeout_ms_.store(timeout_ms,
                                                std::memory_order_release);
                 auto_release_enabled_.store(enabled,
@@ -5814,11 +6054,64 @@ private:
                          torque_released_at_call ? 1 : 0);
 
                 cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(
+                    root, "previous_enabled", previous_enabled);
+                cJSON_AddNumberToObject(
+                    root, "previous_timeout_ms", previous_timeout_ms);
                 cJSON_AddBoolToObject(root, "enabled", enabled);
                 cJSON_AddNumberToObject(root, "timeout_ms", timeout_ms);
                 cJSON_AddBoolToObject(root, "clamped", clamped);
                 cJSON_AddBoolToObject(root, "torque_released_at_call",
                                       torque_released_at_call);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.power.get_auto_sleep",
+            "Read the persisted StackChan automatic display-sleep and PMIC "
+            "shutdown policy. This getter has no runtime side effects.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                const auto result = stackchan_power::GetAutoSleepPolicy(
+                    AutoSleepControlHooks());
+                if (!result.ok) {
+                    throw std::runtime_error(result.error);
+                }
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "enabled", result.enabled);
+                cJSON_AddStringToObject(root, "persistence", "nvs");
+                cJSON_AddNumberToObject(
+                    root, "sleep_after_s",
+                    stackchan_power::kAutoSleepAfterSeconds);
+                cJSON_AddNumberToObject(
+                    root, "shutdown_after_s",
+                    stackchan_power::kAutoShutdownAfterSeconds);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.power.set_auto_sleep",
+            "Persist and immediately apply the StackChan automatic "
+            "display-sleep and PMIC shutdown policy. Enabling always "
+            "restarts the countdown from zero; disabling wakes the display "
+            "and cancels the shutdown countdown.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const bool enabled = properties["enabled"].value<bool>();
+                const auto result = stackchan_power::SetAutoSleepPolicy(
+                    AutoSleepControlHooks(), enabled);
+                if (!result.ok) {
+                    throw std::runtime_error(result.error);
+                }
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                cJSON_AddBoolToObject(root, "previous_enabled",
+                                      result.previous_enabled);
+                cJSON_AddBoolToObject(root, "enabled", result.enabled);
+                cJSON_AddStringToObject(root, "takes_effect", "immediate");
+                cJSON_AddStringToObject(root, "persistence", "nvs");
                 return root;
             });
 

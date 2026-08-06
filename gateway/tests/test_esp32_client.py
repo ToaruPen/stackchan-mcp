@@ -12,7 +12,51 @@ import websockets
 from websockets.frames import Close
 
 from stackchan_mcp import esp32_client
-from stackchan_mcp.esp32_client import ESP32Connection, ESP32Manager, _hardware_lane
+from stackchan_mcp.camera_datagram import (
+    CameraDatagramSession,
+    encode_hello,
+    split_frame,
+)
+from stackchan_mcp.esp32_client import (
+    CameraMediaConnection,
+    ESP32Connection,
+    ESP32Manager,
+    _hardware_lane,
+)
+from stackchan_mcp.head_target_lane import HeadTargetLane
+
+_CONTROL_HEADERS = {"Device-Id": "device-test"}
+
+
+def _camera_binary(sequence: int = 1) -> bytes:
+    jpeg = b"\xff\xd8stream-frame\xff\xd9"
+    header = json.dumps(
+        {
+            "frameId": str(sequence),
+            "deviceId": "device-test",
+            "mimeType": "image/jpeg",
+            "width": 320,
+            "height": 240,
+            "byteLength": len(jpeg),
+            "transport": "binary",
+            "seq": sequence,
+            "captureTimestampMs": 1000,
+            "deviceEncodedAtMs": 1010,
+            "quality": 60,
+        },
+        separators=(",", ":"),
+    ).encode()
+    return b"SCL1" + bytes((1, 0)) + len(header).to_bytes(2, "big") + header + jpeg
+
+
+def _ready_datagram_session(
+    *,
+    token: bytes = bytes(16),
+) -> CameraDatagramSession:
+    session = CameraDatagramSession(token=token, expected_ip="127.0.0.1")
+    session.accept(encode_hello(token), ("127.0.0.1", 41_000), now_ms=0)
+    session.begin_stream()
+    return session
 
 
 @pytest_asyncio.fixture
@@ -30,6 +74,21 @@ async def manager():
     await mgr.stop()
 
 
+@pytest_asyncio.fixture
+async def manager_with_direct_camera_host():
+    mgr = ESP32Manager()
+    await mgr.start(
+        "127.0.0.1",
+        0,
+        camera_datagram_host="192.0.2.10",
+    )
+    server = mgr._server
+    mgr._test_port = server.sockets[0].getsockname()[1]
+
+    yield mgr
+    await mgr.stop()
+
+
 class _FakeServeServer:
     def __init__(self) -> None:
         self.closed = False
@@ -40,6 +99,38 @@ class _FakeServeServer:
 
     async def wait_closed(self) -> None:
         self.waited = True
+
+
+@pytest.mark.asyncio
+async def test_manager_owns_and_stops_head_target_lane() -> None:
+    manager = ESP32Manager()
+
+    assert isinstance(manager.head_target_lane, HeadTargetLane)
+    await manager.stop()
+    assert manager.head_target_lane.status()["phase"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_manager_retains_camera_frame_tasks_until_completion() -> None:
+    manager = ESP32Manager()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle_frame() -> None:
+        started.set()
+        await release.wait()
+
+    task = asyncio.create_task(handle_frame())
+    manager._track_camera_frame_task(task)
+    await started.wait()
+
+    assert task in manager._camera_frame_tasks
+
+    release.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert manager._camera_frame_tasks == set()
 
 
 class _ClosingHandlerWebSocket:
@@ -102,6 +193,39 @@ class _GracefulCloseHandlerWebSocket:
         self.closed = True
 
 
+class _BlockingHelloResponseWebSocket:
+    """Expose manager state while the firmware hello response is in flight."""
+
+    def __init__(self) -> None:
+        self.request = SimpleNamespace(headers={"Device-Id": "device-test"})
+        self.send_started = asyncio.Event()
+        self.release_send = asyncio.Event()
+        self._messages = [
+            json.dumps(
+                {
+                    "type": "hello",
+                    "version": 1,
+                    "features": {"mcp": True, "camera_stream": True},
+                }
+            )
+        ]
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._messages:
+            return self._messages.pop(0)
+        raise StopAsyncIteration
+
+    async def send(self, _data) -> None:
+        self.send_started.set()
+        await self.release_send.wait()
+
+    async def close(self) -> None:
+        self.release_send.set()
+
+
 @pytest.mark.asyncio
 async def test_manager_starts_and_stops():
     """Manager can start and stop cleanly."""
@@ -109,6 +233,79 @@ async def test_manager_starts_and_stops():
     await mgr.start("127.0.0.1", 0)
     assert mgr._server is not None
     await mgr.stop()
+    assert mgr._server is None
+
+
+@pytest.mark.asyncio
+async def test_manager_refuses_non_loopback_bind_without_token(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_TOKEN", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
+
+    async def fail_serve(*_args, **_kwargs):
+        raise AssertionError("bind safety must run before opening the WebSocket")
+
+    monkeypatch.setattr(websockets, "serve", fail_serve)
+    mgr = ESP32Manager()
+
+    with pytest.raises(ValueError, match="non-loopback"):
+        await mgr.start("0.0.0.0", 8765)
+
+    assert mgr._server is None
+
+
+@pytest.mark.asyncio
+async def test_manager_starts_and_stops_camera_datagram_listener():
+    mgr = ESP32Manager()
+
+    await mgr.start("127.0.0.1", 0)
+
+    assert mgr._camera_datagram_endpoint is not None
+    assert mgr._camera_datagram_port > 0
+
+    await mgr.stop()
+
+    assert mgr._camera_datagram_endpoint is None
+    assert mgr._camera_datagram_port == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_routes_udp_hello_only_to_matching_session():
+    token = bytes(range(16))
+    session = CameraDatagramSession(token=token, expected_ip="127.0.0.1")
+    mgr = ESP32Manager()
+    await mgr.start("127.0.0.1", 0)
+    mgr._camera_datagram_sessions[token] = session
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        asyncio.DatagramProtocol,
+        remote_addr=("127.0.0.1", mgr._camera_datagram_port),
+    )
+    try:
+        transport.sendto(encode_hello(bytes(reversed(token))))
+        await asyncio.sleep(0.01)
+        assert session.ready is False
+
+        transport.sendto(encode_hello(token))
+        await session.wait_ready(timeout_s=0.2)
+        assert session.peer is not None
+        assert session.peer[0] == "127.0.0.1"
+    finally:
+        transport.close()
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_closes_server_when_camera_cleanup_fails(monkeypatch):
+    mgr = ESP32Manager()
+    await mgr.start("127.0.0.1", 0)
+
+    async def fail_camera_cleanup() -> None:
+        raise ConnectionError("device disconnected during camera cleanup")
+
+    monkeypatch.setattr(mgr.camera_stream, "stop_all", fail_camera_cleanup)
+
+    await mgr.stop()
+
     assert mgr._server is None
 
 
@@ -166,11 +363,46 @@ async def test_get_status_disconnected():
 
 
 @pytest.mark.asyncio
+async def test_control_websocket_rejects_missing_device_identity(manager):
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+    ) as ws:
+        with pytest.raises(websockets.exceptions.ConnectionClosed):
+            await asyncio.wait_for(ws.recv(), timeout=0.2)
+
+    assert manager.device_connected is False
+
+
+@pytest.mark.asyncio
+async def test_control_is_registered_before_hello_response_allows_media_attach(
+    monkeypatch,
+):
+    manager = ESP32Manager()
+    ws = _BlockingHelloResponseWebSocket()
+
+    async def skip_init(_connection, _device_id) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_init_device", skip_init)
+    handler = asyncio.create_task(manager._handler(ws))  # type: ignore[arg-type]
+    await asyncio.wait_for(ws.send_started.wait(), timeout=0.2)
+
+    assert manager.connection is not None
+    assert manager.connection.device_id == "device-test"
+
+    ws.release_send.set()
+    await asyncio.wait_for(handler, timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_esp32_hello_handshake(manager):
     """ESP32 can connect and complete hello handshake."""
     port = manager._test_port
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
         # Send hello
         hello = {
             "type": "hello",
@@ -264,11 +496,21 @@ async def test_esp32_tool_call_relay(manager):
     """Gateway relays tool calls to ESP32."""
     port = manager._test_port
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
         # Complete handshake
-        await _complete_handshake(ws, tools=[
-            {"name": "self.robot.set_head_angles", "description": "Set head", "inputSchema": {}}
-        ])
+        await _complete_handshake(
+            ws,
+            tools=[
+                {
+                    "name": "self.robot.set_head_angles",
+                    "description": "Set head",
+                    "inputSchema": {},
+                }
+            ],
+        )
 
         await asyncio.sleep(0.2)
 
@@ -311,7 +553,10 @@ async def test_esp32_disconnect_handling(manager):
     """Manager handles ESP32 disconnection gracefully."""
     port = manager._test_port
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
         await _complete_handshake(ws)
         await asyncio.sleep(0.2)
         assert manager.device_connected is True
@@ -319,6 +564,29 @@ async def test_esp32_disconnect_handling(manager):
     # Connection closed
     await asyncio.sleep(0.2)
     assert manager.device_connected is False
+
+
+@pytest.mark.asyncio
+async def test_active_disconnect_notifies_camera_stream(manager, monkeypatch):
+    disconnected = asyncio.Event()
+
+    async def record_disconnect() -> None:
+        disconnected.set()
+
+    monkeypatch.setattr(
+        manager.camera_stream,
+        "on_device_disconnected",
+        record_disconnect,
+    )
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
+        await _complete_handshake(ws)
+        await asyncio.sleep(0.2)
+
+    await asyncio.wait_for(disconnected.wait(), timeout=1)
 
 
 @pytest.mark.asyncio
@@ -419,6 +687,24 @@ async def test_auth_rejection(manager):
         del os.environ["STACKCHAN_TOKEN"]
 
 
+@pytest.mark.asyncio
+async def test_camera_media_connection_uses_the_same_bearer_auth(manager, monkeypatch):
+    monkeypatch.setenv("STACKCHAN_TOKEN", "test-secret-token")
+
+    with pytest.raises(websockets.exceptions.InvalidStatus) as exc_info:
+        async with websockets.connect(
+            f"ws://127.0.0.1:{manager._test_port}",
+            additional_headers={
+                "Authorization": "Bearer wrong-token",
+                "Camera-Stream": "1",
+                "Device-Id": "device-test",
+            },
+        ):
+            pass
+
+    assert exc_info.value.response.status_code == 401
+
+
 # ---------------------------------------------------------------------------
 # Parallel hardware-lane dispatch (Issue #73)
 # ---------------------------------------------------------------------------
@@ -443,6 +729,18 @@ async def test_auth_rejection(manager):
 def test_hardware_lane_covers_gateway_tool_routes(tool_name, lane):
     """Gateway-routed ESP32 tools map to explicit hardware lanes."""
     assert _hardware_lane(tool_name) == lane
+
+
+def test_cached_motion_state_uses_non_bus_telemetry_lane():
+    """Cached interpolation state must not queue behind servo-bus commands."""
+    assert (
+        _hardware_lane(
+            "self.robot.get_head_angles",
+            {"cached_motion_state": True},
+        )
+        == "servo_telemetry"
+    )
+    assert _hardware_lane("self.robot.get_head_angles", {}) == "servo"
 
 
 @pytest.mark.asyncio
@@ -620,13 +918,28 @@ async def test_init_auto_renders_idle_avatar_after_tools_list():
     """A successful initialize + tools/list sends idle set_avatar once."""
     ws = _AutoMcpWebSocket()
     connection = ESP32Connection(ws, session_id="session-auto")  # type: ignore[arg-type]
+    connection.device_id = "device-test"
     ws.connection = connection
     mgr = ESP32Manager()
+    mgr._connection = connection
+    mgr._camera_connection = CameraMediaConnection(
+        _FakeWebSocket(),  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=_ready_datagram_session(),
+    )
+    ready_calls = 0
+
+    async def record_ready() -> None:
+        nonlocal ready_calls
+        ready_calls += 1
+
+    mgr.camera_stream.on_device_ready = record_ready  # type: ignore[method-assign]
 
     await mgr._init_device(connection, "device-test")
 
     assert ws.tool_calls == [("self.display.set_avatar", {"face": "idle"})]
     assert connection.avatar_render_sent is True
+    assert ready_calls == 1
 
 
 @pytest.mark.asyncio
@@ -795,6 +1108,41 @@ class _GateableConnection:
         return {"content": [{"type": "text", "text": name}]}, None
 
 
+class _RecordingConnection:
+    """Fake initialized connection that records exact tool arguments."""
+
+    connected = True
+    initialized = True
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        return {"content": [{"type": "text", "text": "{}"}]}, None
+
+
+@pytest.mark.asyncio
+async def test_head_target_seed_uses_cached_motion_state() -> None:
+    """Lane startup must not block the firmware main task on servo-bus reads."""
+    connection = _RecordingConnection()
+    mgr = ESP32Manager()
+    mgr._connection = connection  # type: ignore[assignment]
+
+    await mgr.acquire_head_target_lane()
+    try:
+        await mgr.read_head_target_pose()
+    finally:
+        await mgr.release_head_target_lane()
+
+    assert connection.calls == [
+        (
+            "self.robot.get_head_angles",
+            {"cached_motion_state": True},
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_manager_call_tools_dispatches_independent_lanes_in_parallel():
     """Servo, LED, and avatar calls start together instead of waiting in line."""
@@ -916,6 +1264,157 @@ async def test_manager_call_tools_serializes_calls_on_same_hardware_lane():
     ]
 
 
+@pytest.mark.asyncio
+async def test_manager_pipelines_cached_motion_state_around_servo_bus_call():
+    """Cached interpolation telemetry remains non-blocking during a servo call."""
+    releases = {
+        "self.robot.set_head_angles": asyncio.Event(),
+        "self.robot.get_head_angles": asyncio.Event(),
+    }
+    connection = _GateableConnection(releases)
+    mgr = ESP32Manager()
+    mgr._connection = connection  # type: ignore[assignment]
+
+    task = asyncio.create_task(
+        mgr.call_tools(
+            [
+                ("self.robot.set_head_angles", {"yaw": 0, "pitch": 45}),
+                (
+                    "self.robot.get_head_angles",
+                    {"cached_motion_state": True},
+                ),
+            ]
+        )
+    )
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert connection.started == [
+        "self.robot.set_head_angles",
+        "self.robot.get_head_angles",
+    ]
+
+    for release in releases.values():
+        release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_head_target_reservation_pipelines_two_and_blocks_regular_servo():
+    releases = {
+        "self.robot.set_head_angles": asyncio.Event(),
+        "self.led.set_many": asyncio.Event(),
+    }
+    connection = _GateableConnection(releases)
+    mgr = ESP32Manager()
+    mgr._connection = connection  # type: ignore[assignment]
+
+    await mgr.acquire_head_target_lane()
+    first = asyncio.create_task(mgr.call_head_target_tool({"yaw": 4, "pitch": 33}))
+    second = asyncio.create_task(mgr.call_head_target_tool({"yaw": 8, "pitch": 33}))
+    regular_servo = asyncio.create_task(
+        mgr.call_tool("self.robot.set_head_angles", {"yaw": 12, "pitch": 33})
+    )
+    led = asyncio.create_task(mgr.call_tool("self.led.set_many", {"colors": "[]"}))
+    for _ in range(10):
+        if (
+            connection.started.count("self.robot.set_head_angles") == 2
+            and "self.led.set_many" in connection.started
+        ):
+            break
+        await asyncio.sleep(0)
+
+    assert connection.started.count("self.robot.set_head_angles") == 2
+    assert "self.led.set_many" in connection.started
+    assert not regular_servo.done()
+
+    for release in releases.values():
+        release.set()
+    await asyncio.wait_for(asyncio.gather(first, second, led), timeout=1.0)
+    assert connection.started.count("self.robot.set_head_angles") == 2
+
+    await mgr.release_head_target_lane()
+    await asyncio.wait_for(regular_servo, timeout=1.0)
+    assert connection.started.count("self.robot.set_head_angles") == 3
+
+
+@pytest.mark.asyncio
+async def test_reserved_head_target_never_moves_to_replacement_connection():
+    old_connection = _GateableConnection(
+        {"self.robot.set_head_angles": asyncio.Event()}
+    )
+    new_connection = _GateableConnection(
+        {"self.robot.set_head_angles": asyncio.Event()}
+    )
+    mgr = ESP32Manager()
+    mgr._connection = old_connection  # type: ignore[assignment]
+    await mgr.acquire_head_target_lane()
+    mgr._connection = new_connection  # type: ignore[assignment]
+
+    result, error = await mgr.call_head_target_tool({"yaw": 4, "pitch": 33})
+
+    assert result is None
+    assert error == {"code": -32000, "message": "ESP32 not connected"}
+    assert old_connection.started == []
+    assert new_connection.started == []
+    await mgr.release_head_target_lane()
+
+
+class _ImmediateHeadLaneConnection:
+    connected = True
+    initialized = True
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_tool(self, name, arguments):  # noqa: ARG002 - test fake
+        self.calls.append(name)
+        if name == "self.robot.get_head_angles":
+            payload = {"yaw": 0, "pitch": 33}
+        elif name == "self.wifi.set_power_save":
+            payload = {"ok": True}
+        else:
+            payload = {"ok": True, "servo_ok": True}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(payload),
+                }
+            ]
+        }, None
+
+    def disconnect(self, *, reason: str = "unspecified") -> None:
+        del reason
+        self.connected = False
+
+
+@pytest.mark.asyncio
+async def test_replacement_stops_lane_before_switching_reserved_connection():
+    old_connection = _ImmediateHeadLaneConnection()
+    new_connection = _ImmediateHeadLaneConnection()
+    mgr = ESP32Manager()
+    mgr._connection = old_connection  # type: ignore[assignment]
+    await mgr.head_target_lane.start(
+        rate_hz=10,
+        max_step_deg=4,
+        max_pending_age_ms=180,
+        speed_dps=90,
+    )
+
+    assert mgr._head_target_lane_connection is old_connection
+    assert mgr._tool_lane_locks["servo"].locked()
+
+    registered = await mgr._register_connection(new_connection)  # type: ignore[arg-type]
+
+    assert registered is True
+    assert old_connection.connected is False
+    assert mgr._connection is new_connection
+    assert mgr._head_target_lane_connection is None
+    assert not mgr._tool_lane_locks["servo"].locked()
+    assert mgr.head_target_lane.status()["phase"] == "stopped"
+
+
 # ---------------------------------------------------------------------------
 # send_audio_frame (TTS pipeline egress, Issue #70 PR2)
 # ---------------------------------------------------------------------------
@@ -926,9 +1425,13 @@ class _FakeWebSocket:
 
     def __init__(self) -> None:
         self.sent: list[bytes | str] = []
+        self.closed = False
 
     async def send(self, data):
         self.sent.append(data)
+
+    async def close(self, **_kwargs):
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -966,6 +1469,657 @@ async def test_manager_send_audio_frame_no_device():
 
     with pytest.raises(ConnectionError):
         await mgr.send_audio_frame(b"opus_payload_bytes")
+
+
+@pytest.mark.asyncio
+async def test_camera_stream_requires_a_matching_dedicated_media_connection():
+    control_ws = _FakeWebSocket()
+    control = ESP32Connection(
+        control_ws,
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    media_ws = _FakeWebSocket()
+    manager = ESP32Manager()
+    manager._connection = control
+
+    assert manager.supports_camera_stream is False
+
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="another-device",
+    )
+    assert manager.supports_camera_stream is False
+
+    unready = CameraDatagramSession(token=bytes(16), expected_ip="127.0.0.1")
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=unready,
+    )
+    assert manager.supports_camera_stream is False
+
+    ready = CameraDatagramSession(token=bytes(16), expected_ip="127.0.0.1")
+    ready.accept(encode_hello(bytes(16)), ("127.0.0.1", 41_000), now_ms=0)
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=ready,
+    )
+    assert manager.supports_camera_stream is True
+
+
+@pytest.mark.asyncio
+async def test_camera_stream_credit_lease_uses_only_the_datagram_endpoint(
+    monkeypatch,
+):
+    control_ws = _FakeWebSocket()
+    control = ESP32Connection(
+        control_ws,
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    media_ws = _FakeWebSocket()
+    manager = ESP32Manager()
+    manager._connection = control
+    session = _ready_datagram_session()
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=session,
+    )
+    sent: list[tuple[bytes, tuple[str, int]]] = []
+
+    class RecordingEndpoint:
+        def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+            sent.append((data, addr))
+
+    manager._camera_datagram_endpoint = RecordingEndpoint()  # type: ignore[assignment]
+    monkeypatch.setattr(esp32_client, "CAMERA_DATAGRAM_CREDIT_INTERVAL_S", 0.001)
+
+    await manager.begin_camera_datagram_stream()
+    for _ in range(100):
+        if len(sent) >= 2:
+            break
+        await asyncio.sleep(0.001)
+    await manager.end_camera_datagram_stream()
+    count_after_stop = len(sent)
+    await asyncio.sleep(0.003)
+
+    assert control_ws.sent == []
+    assert media_ws.sent == []
+    assert count_after_stop >= 2
+    assert len(sent) == count_after_stop
+    assert {addr for _, addr in sent} == {("127.0.0.1", 41_000)}
+    assert all(data.endswith(b"\x04") for data, _ in sent)
+
+
+@pytest.mark.asyncio
+async def test_camera_stream_end_discards_pending_and_rejects_late_chunks(
+    monkeypatch,
+):
+    manager = ESP32Manager()
+    session = _ready_datagram_session()
+    manager._camera_connection = CameraMediaConnection(
+        _FakeWebSocket(),  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=session,
+    )
+
+    class RecordingEndpoint:
+        def sendto(self, _data: bytes, _addr: tuple[str, int]) -> None:
+            return None
+
+    manager._camera_datagram_endpoint = RecordingEndpoint()  # type: ignore[assignment]
+    monkeypatch.setattr(esp32_client, "CAMERA_DATAGRAM_CREDIT_INTERVAL_S", 1)
+    await manager.begin_camera_datagram_stream()
+    pending = split_frame(token=session.token, sequence=5, frame=bytes(2_000))
+    assert session.accept(pending[0], ("127.0.0.1", 41_000), now_ms=1) is None
+    assert session.status()["pending"] is True
+
+    await manager.end_camera_datagram_stream()
+
+    assert session.status()["pending"] is False
+    assert session.accept(
+        split_frame(token=session.token, sequence=6, frame=b"late")[0],
+        ("127.0.0.1", 41_000),
+        now_ms=2,
+    ) is None
+    assert session.status()["completed_frames"] == 0
+
+
+@pytest.mark.asyncio
+async def test_active_control_departure_retires_matching_camera_session():
+    manager = ESP32Manager()
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    manager._connection = control
+    media_ws = _FakeWebSocket()
+    session = _ready_datagram_session()
+    media = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=session,
+        control=control,
+    )
+    manager._camera_connection = media
+    manager._camera_datagram_sessions[session.token] = session
+    manager._camera_ready_pair = (control, media)
+
+    await manager._detach_camera_media(control)
+
+    assert manager._camera_connection is None
+    assert manager._camera_ready_pair is None
+    assert session.token not in manager._camera_datagram_sessions
+    assert session.ready is False
+    assert media_ws.closed is True
+
+
+def test_camera_datagram_status_preserves_safe_counters_after_session_retirement():
+    manager = ESP32Manager()
+    session = _ready_datagram_session()
+    envelope = _camera_binary(sequence=7)
+    for packet in split_frame(token=session.token, sequence=7, frame=envelope):
+        session.accept(packet, ("127.0.0.1", 41_000), now_ms=1)
+    manager._camera_datagram_sessions[session.token] = session
+    manager._camera_connection = CameraMediaConnection(
+        _FakeWebSocket(),  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=session,
+    )
+
+    active = manager.camera_datagram_status()
+    assert active["ready"] is True
+    assert active["completed_frames"] == 1
+
+    manager._retire_camera_datagram_session(session)
+
+    retired = manager.camera_datagram_status()
+    assert retired["ready"] is False
+    assert retired["completed_frames"] == 1
+    assert "token" not in retired
+    assert "peer" not in retired
+    assert "source_ip" not in retired
+
+    manager._retire_camera_datagram_session(session)
+    assert manager.camera_datagram_status()["completed_frames"] == 1
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_closes_the_dedicated_camera_connection():
+    media_ws = _FakeWebSocket()
+    manager = ESP32Manager()
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+    )
+
+    await manager.stop()
+
+    assert media_ws.closed is True
+    assert manager._camera_connection is None
+
+
+@pytest.mark.asyncio
+async def test_camera_media_websocket_configures_udp_and_routes_no_tcp_frames(
+    manager,
+):
+    control_ws = _FakeWebSocket()
+    control = ESP32Connection(
+        control_ws,
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    manager._connection = control
+    manager.camera_stream.can_accept_frames = lambda: True  # type: ignore[method-assign]
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+        additional_headers={
+            "Camera-Stream": "1",
+            "Device-Id": "device-test",
+        },
+    ) as media_ws:
+        config = json.loads(await asyncio.wait_for(media_ws.recv(), timeout=1.0))
+        assert config["type"] == "camera_datagram_config"
+        assert config["version"] == 1
+        assert config["maxDatagramBytes"] == 1_200
+        assert config["port"] == manager._camera_datagram_port
+        token = bytes.fromhex(config["token"])
+        assert len(token) == 16
+        loop = asyncio.get_running_loop()
+        udp_transport, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol,
+            remote_addr=("127.0.0.1", config["port"]),
+        )
+        udp_transport.sendto(encode_hello(token))
+        for _ in range(20):
+            if manager.supports_camera_stream:
+                break
+            await asyncio.sleep(0.01)
+        assert manager.supports_camera_stream is True
+        await manager.begin_camera_datagram_stream()
+
+        await media_ws.send(_camera_binary(sequence=6))
+        await asyncio.sleep(0.01)
+        assert manager.camera_frames.status()["available"] is False
+
+        for datagram in split_frame(
+            token=token,
+            sequence=7,
+            frame=_camera_binary(sequence=7),
+        ):
+            udp_transport.sendto(datagram)
+
+        frame = await manager.camera_frames.wait_for_frame(
+            after_sequence=None,
+            timeout_s=1.0,
+        )
+        assert frame is not None
+        assert frame.sequence == 7
+        assert control_ws.sent == []
+        udp_transport.close()
+
+    for _ in range(20):
+        if not manager.supports_camera_stream:
+            break
+        await asyncio.sleep(0.01)
+    assert manager.supports_camera_stream is False
+
+
+@pytest.mark.asyncio
+async def test_camera_media_disconnect_preserves_logical_stream_lease(
+    manager,
+    monkeypatch,
+):
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    manager._connection = control
+    disconnected = asyncio.Event()
+    stop_all_calls = 0
+
+    async def record_disconnect() -> None:
+        disconnected.set()
+
+    async def record_stop_all() -> None:
+        nonlocal stop_all_calls
+        stop_all_calls += 1
+
+    monkeypatch.setattr(
+        manager.camera_stream,
+        "on_device_disconnected",
+        record_disconnect,
+    )
+    monkeypatch.setattr(manager.camera_stream, "stop_all", record_stop_all)
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+        additional_headers={
+            "Camera-Stream": "1",
+            "Device-Id": "device-test",
+        },
+    ) as media_ws:
+        config = json.loads(await asyncio.wait_for(media_ws.recv(), timeout=0.2))
+        token = bytes.fromhex(config["token"])
+        loop = asyncio.get_running_loop()
+        udp_transport, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol,
+            remote_addr=("127.0.0.1", config["port"]),
+        )
+        udp_transport.sendto(encode_hello(token))
+        for _ in range(20):
+            if manager.supports_camera_stream:
+                break
+            await asyncio.sleep(0.01)
+        assert manager.supports_camera_stream is True
+        udp_transport.close()
+
+    await asyncio.wait_for(disconnected.wait(), timeout=0.2)
+    assert stop_all_calls == 0
+    assert manager.supports_camera_stream is False
+
+
+@pytest.mark.asyncio
+async def test_camera_media_advertises_direct_udp_host_without_binding_to_proxy_ip(
+    manager_with_direct_camera_host,
+):
+    manager = manager_with_direct_camera_host
+    control_ws = _FakeWebSocket()
+    control = ESP32Connection(
+        control_ws,
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    manager._connection = control
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+        additional_headers={
+            "Camera-Stream": "1",
+            "Device-Id": "device-test",
+        },
+    ) as media_ws:
+        config = json.loads(await asyncio.wait_for(media_ws.recv(), timeout=1.0))
+        assert config["host"] == "192.0.2.10"
+        session = manager._camera_connection.datagram_session
+        assert session is not None
+        assert session.accept(
+            encode_hello(bytes.fromhex(config["token"])),
+            ("192.0.2.20", 41_000),
+            now_ms=0,
+        ) is None
+        await asyncio.wait_for(session.wait_ready(timeout_s=0.1), timeout=0.2)
+        assert manager.supports_camera_stream is True
+
+
+@pytest.mark.asyncio
+async def test_camera_media_attach_retries_ready_after_control_initialization(
+    manager,
+    monkeypatch,
+):
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {"camera_stream": True}
+    control._initialized = True
+    control._tools_discovered = True
+    manager._connection = control
+    ready = asyncio.Event()
+
+    async def record_ready() -> None:
+        ready.set()
+
+    monkeypatch.setattr(manager.camera_stream, "on_device_ready", record_ready)
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+        additional_headers={
+            "Camera-Stream": "1",
+            "Device-Id": "device-test",
+        },
+    ) as media_ws:
+        config = json.loads(await asyncio.wait_for(media_ws.recv(), timeout=0.2))
+        token = bytes.fromhex(config["token"])
+        loop = asyncio.get_running_loop()
+        udp_transport, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol,
+            remote_addr=("127.0.0.1", config["port"]),
+        )
+        udp_transport.sendto(encode_hello(token))
+        await asyncio.wait_for(ready.wait(), timeout=0.2)
+        udp_transport.close()
+
+
+@pytest.mark.asyncio
+async def test_camera_ready_runs_once_for_the_same_control_media_pair(monkeypatch):
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    control._initialized = True
+    control._tools_discovered = True
+    media = CameraMediaConnection(
+        _FakeWebSocket(),  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=_ready_datagram_session(),
+    )
+    manager = ESP32Manager()
+    manager._connection = control
+    manager._camera_connection = media
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def record_ready() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(manager.camera_stream, "on_device_ready", record_ready)
+
+    first = asyncio.create_task(manager._ensure_camera_stream_ready(control))
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    second = asyncio.create_task(manager._ensure_camera_stream_ready(control))
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_camera_media_websocket_rejects_a_nonmatching_device(manager):
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {"camera_stream": True}
+    manager._connection = control
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{manager._test_port}",
+        additional_headers={
+            "Camera-Stream": "1",
+            "Device-Id": "different-device",
+        },
+    ) as media_ws:
+        with pytest.raises(websockets.exceptions.ConnectionClosed):
+            await asyncio.wait_for(media_ws.recv(), timeout=0.2)
+
+    assert manager._camera_connection is None
+    assert manager.supports_camera_stream is False
+
+
+@pytest.mark.asyncio
+async def test_datagram_camera_router_publishes_frame_without_per_frame_credit(
+    monkeypatch,
+):
+    audio_frames: list[tuple[bytes, str]] = []
+
+    async def record_audio(frame: bytes, session_id: str) -> None:
+        audio_frames.append((frame, session_id))
+
+    monkeypatch.setattr(esp32_client, "handle_audio_frame", record_audio)
+    ws = _FakeWebSocket()
+    connection = ESP32Connection(ws, session_id="camera-session")  # type: ignore[arg-type]
+    connection.device_id = "device-test"
+    connection.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    media_ws = _FakeWebSocket()
+    manager = ESP32Manager()
+    manager._connection = connection
+    session = _ready_datagram_session()
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=session,
+    )
+    manager.camera_stream.can_accept_frames = lambda: True  # type: ignore[method-assign]
+
+    await manager._handle_camera_datagram_frame(
+        _camera_binary(sequence=8),
+        session=session,
+    )
+
+    frame = await manager.camera_frames.wait_for_frame(
+        after_sequence=None,
+        timeout_s=0,
+    )
+    assert frame is not None
+    assert frame.sequence == 8
+    assert audio_frames == []
+    assert ws.sent == []
+    assert media_ws.sent == []
+    assert manager.camera_stream.status()["datagram_lease_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_datagram_camera_router_drops_mismatched_frame_identity():
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "expected-device"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    media_ws = _FakeWebSocket()
+    manager = ESP32Manager()
+    manager._connection = control
+    session = _ready_datagram_session()
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="expected-device",
+        datagram_session=session,
+    )
+    manager.camera_stream.can_accept_frames = lambda: True  # type: ignore[method-assign]
+
+    await manager._handle_camera_datagram_frame(
+        _camera_binary(sequence=8),
+        session=session,
+    )
+
+    assert manager.camera_frames.status()["available"] is False
+    assert media_ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_datagram_camera_router_drops_frames_after_control_disconnect():
+    control = ESP32Connection(
+        _FakeWebSocket(),
+        session_id="camera-session",
+    )  # type: ignore[arg-type]
+    control.device_id = "device-test"
+    control.features = {
+        "camera_stream": True,
+        "camera_datagram_v1": True,
+    }
+    media_ws = _FakeWebSocket()
+    manager = ESP32Manager()
+    manager._connection = control
+    session = _ready_datagram_session()
+    manager._camera_connection = CameraMediaConnection(
+        media_ws,  # type: ignore[arg-type]
+        device_id="device-test",
+        datagram_session=session,
+    )
+    manager.camera_stream.can_accept_frames = lambda: True  # type: ignore[method-assign]
+    control.disconnect()
+
+    await manager._handle_camera_datagram_frame(
+        _camera_binary(sequence=9),
+        session=session,
+    )
+
+    assert manager.camera_frames.status()["available"] is False
+    assert media_ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_control_binary_router_drops_camera_frames_without_media_fallback():
+    ws = _FakeWebSocket()
+    connection = ESP32Connection(ws, session_id="camera-session")  # type: ignore[arg-type]
+    manager = ESP32Manager()
+    manager._connection = connection
+
+    await manager._handle_binary_message(
+        connection,
+        _camera_binary(sequence=9),
+        "camera-session",
+    )
+
+    assert manager.camera_frames.status()["available"] is False
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_binary_router_keeps_raw_opus_on_the_existing_audio_path(
+    monkeypatch,
+):
+    audio_frames: list[tuple[bytes, str]] = []
+
+    async def record_audio(frame: bytes, session_id: str) -> None:
+        audio_frames.append((frame, session_id))
+
+    monkeypatch.setattr(esp32_client, "handle_audio_frame", record_audio)
+    ws = _FakeWebSocket()
+    connection = ESP32Connection(ws, session_id="audio-session")  # type: ignore[arg-type]
+    manager = ESP32Manager()
+
+    await manager._handle_binary_message(
+        connection,
+        b"raw-opus-frame",
+        "audio-session",
+    )
+
+    assert audio_frames == [(b"raw-opus-frame", "audio-session")]
+    assert ws.sent == []
+    assert manager.camera_frames.status()["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_binary_router_drops_invalid_scl1_without_forwarding_to_audio(
+    monkeypatch,
+    caplog,
+):
+    audio_frames: list[tuple[bytes, str]] = []
+
+    async def record_audio(frame: bytes, session_id: str) -> None:
+        audio_frames.append((frame, session_id))
+
+    monkeypatch.setattr(esp32_client, "handle_audio_frame", record_audio)
+    ws = _FakeWebSocket()
+    connection = ESP32Connection(ws, session_id="camera-session")  # type: ignore[arg-type]
+    manager = ESP32Manager()
+    caplog.set_level(logging.WARNING, logger="stackchan_mcp.esp32_client")
+
+    await manager._handle_binary_message(
+        connection,
+        b"SCL1",
+        "camera-session",
+    )
+
+    assert audio_frames == []
+    assert ws.sent == []
+    assert manager.camera_frames.status()["available"] is False
+    assert "invalid SCL1 camera frame" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1348,16 +2502,23 @@ async def test_device_driven_listen_pushes_to_hook(manager_with_hook):
     mgr, calls = manager_with_hook
     port = mgr._test_port
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
         await _complete_handshake(ws)
 
         # Device-initiated listen.start
-        await ws.send(json.dumps({
-            "session_id": "",  # device fills its own; ignored on receive
-            "type": "listen",
-            "state": "start",
-            "mode": "manual",
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "session_id": "",  # device fills its own; ignored on receive
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "manual",
+                }
+            )
+        )
 
         # Wait for gateway to open the recording slot. We can't observe
         # the gateway's internals through the WS, so poll the module
@@ -1376,11 +2537,15 @@ async def test_device_driven_listen_pushes_to_hook(manager_with_hook):
         await asyncio.sleep(0.1)
 
         # Device-initiated listen.stop
-        await ws.send(json.dumps({
-            "session_id": "",
-            "type": "listen",
-            "state": "stop",
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "session_id": "",
+                    "type": "listen",
+                    "state": "stop",
+                }
+            )
+        )
 
         # Wait for the push task to fire (asyncio.create_task in the
         # handler dispatches it eagerly; one event-loop tick is enough,
@@ -1404,14 +2569,21 @@ async def test_device_driven_listen_disabled_when_no_hook(manager):
 
     port = manager._test_port
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
         await _complete_handshake(ws)
 
-        await ws.send(json.dumps({
-            "type": "listen",
-            "state": "start",
-            "mode": "manual",
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "manual",
+                }
+            )
+        )
         # Give the gateway time to NOT do anything.
         await asyncio.sleep(0.2)
         assert not is_recording()
@@ -1426,13 +2598,20 @@ async def test_device_driven_listen_cleanup_on_disconnect(manager_with_hook):
     mgr, calls = manager_with_hook
     port = mgr._test_port
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        additional_headers=_CONTROL_HEADERS,
+    ) as ws:
         await _complete_handshake(ws)
-        await ws.send(json.dumps({
-            "type": "listen",
-            "state": "start",
-            "mode": "manual",
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "listen",
+                    "state": "start",
+                    "mode": "manual",
+                }
+            )
+        )
         for _ in range(20):
             await asyncio.sleep(0.05)
             if is_recording():

@@ -49,6 +49,7 @@
 | `get_status` | ゲートウェイ接続状態 | ✅ |
 | `get_device_info` | ESP32 デバイス状態 (バッテリー/音量/WiFi 等) | ✅ |
 | `take_photo(question?)` | カメラ撮影 → JPEG 保存 → パス返す | ✅ |
+| `camera_stream(action, fps?, quality?)` | 最新JPEG 1枚だけをメモリに保持するstreamを参照数管理（`start` / `stop` / `status`）。画像はディスクへ保存しない | ✅ |
 | `set_volume(volume)` | スピーカー音量 (0-100) | ✅ |
 | `set_brightness(brightness)` | 画面明るさ (0-100) | ✅ |
 | `move_head(yaw, pitch, speed?)` | 首を動かす (サーボ)。`pitch` は M5Stack 推奨運用レンジ `5..85` に制限される。ファームウェア側のハードクランプ (`0..88`) を使いたい場合は、firmware-side の `set_head_angles` デバイスツールを利用する | ✅ |
@@ -183,7 +184,7 @@ instance を試し続ける場合があります。
 
 - `websocket.url` — ゲートウェイ WebSocket URL (例: `ws://<gateway-host>:8765/`)
 - `websocket.fallback_url` — `websocket.url` に接続できない、または server hello が完了しない場合に試す 2 番目の gateway URL
-- `websocket.token` — `Authorization: Bearer <token>` で送信される bearer トークン。ゲートウェイ側の `STACKCHAN_TOKEN` / `BEARER_TOKEN` と照合される (両方空にすれば認証スキップ)
+- `websocket.token` — `Authorization: Bearer <token>` で送信される bearer トークン。ゲートウェイ側の `STACKCHAN_TOKEN` / `BEARER_TOKEN` と照合される。トークンなし接続は gateway が loopback に bind する場合だけ利用でき、非loopbackの WebSocket/UDP bind ではいずれかの gateway token が必須
 
 設定方法は実用的に 4 つあり、加えて一時的な source-level escape hatch があります:
 
@@ -193,14 +194,14 @@ instance を試し続ける場合があります。
    - `Fallback WebSocket gateway URL` →
      `CONFIG_DEFAULT_WEBSOCKET_FALLBACK_URL`
    - `Default WebSocket auth token (fallback when NVS is empty)` →
-     `CONFIG_DEFAULT_WEBSOCKET_TOKEN` (ゲートウェイが認証不要なら空のままで OK)
+     `CONFIG_DEFAULT_WEBSOCKET_TOKEN` (loopback bind の gateway に限り空のままで可。非loopback gateway では token 必須)
 
    デフォルトでは、対応する NVS キーが空のときだけこの値が使われます。新規デバイスへの初回フラッシュではちょうど期待通りに動作します。primary と fallback の両方を設定した場合、ファームウェアは決まった順番で候補を試し、WebSocket の server hello まで完了した最初の候補を使います。
 
 2. **デバイス上の WiFi 設定 UI を使う（新規ユーザー向け推奨）**: デバイスが WiFi 設定モードになっているとき、`http://192.168.4.1` のキャプティブポータルを開き、**Advanced** タブに切り替えて以下を入力します:
    - **WebSocket Gateway URL**（例: `ws://<gateway-host>:8765/`） — primary な gateway 候補。
    - **Fallback Gateway URL**（例: `wss://<relay-host>/`） — 任意の 2 番目の候補。primary が server hello 完了に失敗したときだけ試行されます。
-   - **Gateway Token** — 任意の bearer トークン。設定時は両候補に対して `Authorization: Bearer <token>` ヘッダで送信されます。WiFi 設定 UI の AP は未認証で開かれるため、GET エンドポイントはトークンの有無だけを返し、現在の値は表示されません。空のまま送信すると既存トークンが保持され、新しい値を入力すると更新、❌ ボタンで build-time の `CONFIG_DEFAULT_WEBSOCKET_TOKEN` に戻ります。Kconfig 既定値が未設定のビルドでは ❌ が認証なしを意味しますが、既定値が組み込まれているビルドでは ❌ で実際に認証が解除されるわけではなく、その既定値に戻る点に注意してください。組み込み既定値があるビルドで認証なしの gateway に向けたい場合は、Kconfig 既定値を空にして再ビルドするか、gateway 側の token を build-time 既定値に揃えてください。
+   - **Gateway Token** — 任意の bearer トークン。設定時は両候補に対して `Authorization: Bearer <token>` ヘッダで送信されます。WiFi 設定 UI の AP は未認証で開かれるため、GET エンドポイントはトークンの有無だけを返し、現在の値は表示されません。空のまま送信すると既存トークンが保持され、新しい値を入力すると更新、❌ ボタンで build-time の `CONFIG_DEFAULT_WEBSOCKET_TOKEN` に戻ります。Kconfig 既定値が未設定のビルドでは ❌ が token を空にしますが、token なし接続が可能なのは loopback bind の gateway だけです。既定値が組み込まれているビルドでは ❌ でその既定値に戻ります。非loopback gateway では build-time 既定値か NVS の token を gateway 側と一致させてください。
 
    送信すると値が `websocket` NVS namespace（`websocket.url` / `websocket.fallback_url` / `websocket.token`）に永続化され、次回起動時に読み込まれます。pre-built ファームウェアを使うエンドユーザー向けの想定経路です。URL フィールド横の ❌ ボタンでクリアしてから再度送信すると、対応する `CONFIG_DEFAULT_WEBSOCKET_*` Kconfig 値（Kconfig 既定値が未設定なら「fallback なし」）に戻ります。
 
@@ -301,8 +302,10 @@ TLS レイヤの切断、ハンドシェイク後にセッションを閉じる�
 同じ再試行経路が動くので、次の接続試行をゲートウェイが受け入れた時点で
 自動復帰します。
 
-別ネットワークから使う場合は、Tailscale Funnel と `VISION_URL` による capture
-callback 設定を [`docs/remote-access.md`](docs/remote-access.md) にまとめています。
+別ネットワークから使う場合は [`docs/remote-access.md`](docs/remote-access.md)
+を参照してください。camera 対応 firmware には WebSocket に加えて gateway へ
+到達できる保護された直接 UDP 経路が必要です。TCP のみの Tailscale Funnel は
+非対応で、UDP listener を公開インターネットへ露出させてはいけません。
 
 ### 3. MCP クライアント登録 (Claude Code 例)
 

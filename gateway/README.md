@@ -56,6 +56,9 @@ uv sync
 
 Edit `.env`:
 - `STACKCHAN_TOKEN`: Bearer token for ESP32 auth (must match firmware setting)
+- `STACKCHAN_CAMERA_DATAGRAM_HOST`: protected LAN or routed-VPN address that
+  the ESP32 can reach directly over UDP. Camera UDP uses the same numeric port
+  as `WS_PORT`. Do not expose it to the public internet.
 - `VISION_URL`: full public capture URL for remote access tunnels, such as
   `https://stackchan.example.ts.net:8443/capture`
 - `VISION_TOKEN`: optional separate Bearer token for capture uploads; if empty,
@@ -98,8 +101,9 @@ By default, the gateway advertises the WebSocket endpoint as
 `_stackchan-mcp._tcp.local.` via mDNS/DNS-SD so fresh firmware can discover it
 on the local LAN. Run `stackchan-mcp --no-mdns` to disable this advertisement.
 
-For non-LAN setups, see [`../docs/remote-access.md`](../docs/remote-access.md)
-for the Tailscale Funnel flow.
+For non-LAN setups, see [`../docs/remote-access.md`](../docs/remote-access.md).
+Camera-enabled firmware requires a protected direct UDP route in addition to
+the WebSocket path; a TCP-only Tailscale Funnel does not provide that route.
 
 When you restart the gateway during development, an already-connected ESP32
 will notice the dropped WebSocket and retry while idle. The retry delay starts
@@ -173,6 +177,7 @@ Same shape, under `mcpServers`.
 | `get_status` | Gateway connection state (ESP32 connected? device info?) |
 | `get_device_info` | ESP32 device status (battery, volume, WiFi, etc.) |
 | `take_photo(question?)` | Trigger camera capture; returns saved JPEG path |
+| `camera_stream(action, fps?, quality?)` | Start, stop, or inspect the reference-counted latest-JPEG stream. `fps` is `1..20`; `quality` is `1..100`. |
 | `set_volume(volume)` | Speaker volume 0-100 |
 | `set_brightness(brightness)` | Screen brightness 0-100 |
 | `move_head(yaw, pitch, speed?)` | Drive yaw + pitch servos |
@@ -192,6 +197,18 @@ Same shape, under `mcpServers`.
 | `beat_mode_update(motion_intensity?, sensitivity?, color?, blink_rate?, motion_enabled?, led_enabled?)` | Update beat-mode motion/LED parameters without restarting capture. |
 | `beat_meta_snapshot()` | Poll the latest beat metadata, active sensitivity/minimum onset floor, capture health, counters, and current motion/LED parameters. |
 | `beat_clip_save(seconds?)` | Save the latest rolling beat-mode audio as a 16 kHz mono WAV temp file and return its path plus captured duration. |
+
+`camera_stream(action="start", fps=20, quality=60)` acquires one stream
+subscription. Each matching start must be paired with
+`camera_stream(action="stop")`; the first subscriber starts the physical
+camera and the last stop shuts it down. Authenticated clients can long-poll
+`GET /camera/latest?after_sequence=N&timeout_ms=M` for the newest
+`image/jpeg`, or inspect aggregate counters through `GET /camera/status`.
+The gateway retains at most one JPEG in memory, applies media-credit
+backpressure, and clears the JPEG bytes after the final subscriber releases
+the stream. An authenticated `/camera/latest` read renews a 30-second idle
+lease; if a client exits without sending `stop`, the gateway stops the producer
+and clears the retained JPEG when that lease expires.
 
 The 12 base LEDs are 12× WS2812C wired to the PY32L020 IO expander
 (expander pin 13, not an ESP32 GPIO), so all four LED tools share the

@@ -45,6 +45,86 @@ def merge_bin() -> None:
         sys.exit(1)
 
 
+def apply_esp_video_dqbuf_timeout() -> None:
+    """Apply the tracked StackChan dequeue bound to esp_video 1.3.1."""
+    component_dir = Path("managed_components/espressif__esp_video")
+    manifest = component_dir / "idf_component.yml"
+    source = component_dir / "src/esp_video_ioctl.c"
+    cmake = component_dir / "CMakeLists.txt"
+    if not manifest.exists() or "version: 1.3.1" not in manifest.read_text(
+        encoding="utf-8"
+    ):
+        raise RuntimeError("esp_video 1.3.1 is required for the dequeue override")
+
+    source_text = source.read_text(encoding="utf-8")
+    source_include = '#include "esp_video.h"\n#include "esp_video_vfs.h"'
+    patched_include = (
+        '#include "esp_video.h"\n'
+        '#include "esp_video_dqbuf_timeout.h"\n'
+        '#include "esp_video_vfs.h"'
+    )
+    source_declaration = (
+        "static esp_err_t esp_video_ioctl_dqbuf("
+        "struct esp_video *video, struct v4l2_buffer *vbuf)\n"
+        "{\n"
+        "    esp_err_t ret;\n"
+        "    struct esp_video_buffer_info info;"
+    )
+    legacy_patched_declaration = source_declaration.replace(
+        "    struct esp_video_buffer_info info;",
+        "    uint32_t ticks = pdMS_TO_TICKS(ESP_VIDEO_DQBUF_TIMEOUT_MS);\n"
+        "    struct esp_video_buffer_info info;",
+    )
+    source_dequeue = "esp_video_recv_element(video, vbuf->type, portMAX_DELAY)"
+    legacy_patched_dequeue = "esp_video_recv_element(video, vbuf->type, ticks)"
+    patched_dequeue = (
+        "esp_video_recv_element("
+        "video, vbuf->type, ESP_VIDEO_DQBUF_WAIT_TICKS)"
+    )
+    if source_include in source_text:
+        source_text = source_text.replace(source_include, patched_include, 1)
+    elif patched_include not in source_text:
+        raise RuntimeError("esp_video include context changed; update the override")
+    if legacy_patched_declaration in source_text:
+        source_text = source_text.replace(
+            legacy_patched_declaration,
+            source_declaration,
+            1,
+        )
+    elif source_declaration not in source_text:
+        raise RuntimeError("esp_video dequeue declaration changed; update the override")
+    if source_dequeue in source_text:
+        source_text = source_text.replace(source_dequeue, patched_dequeue, 1)
+    elif legacy_patched_dequeue in source_text:
+        source_text = source_text.replace(
+            legacy_patched_dequeue,
+            patched_dequeue,
+            1,
+        )
+    elif patched_dequeue not in source_text:
+        raise RuntimeError("esp_video dequeue context changed; update the override")
+    source.write_text(source_text, encoding="utf-8")
+
+    cmake_text = cmake.read_text(encoding="utf-8")
+    private_include = 'set(priv_include_dirs "private_include")'
+    patched_private_include = (
+        'set(priv_include_dirs "private_include" "${PROJECT_DIR}/patches")'
+    )
+    if private_include in cmake_text:
+        cmake_text = cmake_text.replace(
+            private_include,
+            patched_private_include,
+            1,
+        )
+    elif patched_private_include not in cmake_text:
+        raise RuntimeError("esp_video CMake context changed; update the override")
+    cmake.write_text(cmake_text, encoding="utf-8")
+
+
+def should_apply_esp_video_dqbuf_timeout(board_type: str, target: str) -> bool:
+    return board_type == "stackchan" and target in {"esp32p4", "esp32s3"}
+
+
 def zip_bin(name: str, version: str) -> None:
     """Zip build/merged-binary.bin to releases/v{version}_{name}.zip"""
     out_dir = Path("releases")
@@ -435,6 +515,8 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
         if os.system(f"idf.py set-target {target}") != 0:
             print("set-target failed", file=sys.stderr)
             sys.exit(1)
+        if should_apply_esp_video_dqbuf_timeout(board_type, target):
+            apply_esp_video_dqbuf_timeout()
 
         # Append sdkconfig
         with Path("sdkconfig").open("a", encoding='utf-8') as f:

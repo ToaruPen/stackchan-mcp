@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+import ipaddress
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from typing import Any
@@ -27,6 +29,19 @@ from .audio_stream import (
     start_recording,
     stop_recording,
 )
+from .camera_datagram import (
+    SCU1_MAX_DATAGRAM_BYTES,
+    CameraDatagramEndpoint,
+    CameraDatagramSession,
+    peek_token,
+)
+from .camera_stream import (
+    CameraFrameProtocolError,
+    CameraStreamService,
+    LatestCameraFrameStore,
+    parse_camera_frame,
+)
+from .head_target_lane import HeadTargetLane
 from .notify_config import (
     DEFAULT_MESSAGE_TEMPLATES,
     NotifyConfig,
@@ -41,9 +56,25 @@ logger = logging.getLogger(__name__)
 RESPONSE_TIMEOUT = 10.0
 WEBSOCKET_PING_INTERVAL_S = 20
 WEBSOCKET_PING_TIMEOUT_S = 20
+CAMERA_DATAGRAM_CREDIT_INTERVAL_S = 0.25
+MAX_CAMERA_FRAME_BYTES = 5 * 1024 * 1024
+NON_LOOPBACK_TOKEN_REQUIRED_MESSAGE = (
+    "stackchan-mcp: refusing non-loopback ESP32 WebSocket bind without "
+    "STACKCHAN_TOKEN or BEARER_TOKEN"
+)
 
 ToolCall = tuple[str, dict[str, Any]]
 ToolCallResult = tuple[Any, dict[str, Any] | None]
+
+
+def _is_loopback_bind_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 _SET_AVATAR_TOOL = "self.display.set_avatar"
 
@@ -62,8 +93,15 @@ _TOOL_LANES = {
 }
 
 
-def _hardware_lane(tool_name: str) -> str:
+def _hardware_lane(
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+) -> str:
     """Return the hardware lane used for per-peripheral dispatch ordering."""
+    if tool_name == "self.robot.get_head_angles" and arguments == {
+        "cached_motion_state": True
+    }:
+        return "servo_telemetry"
     for prefix, lane in _TOOL_LANES.items():
         if tool_name.startswith(prefix):
             return lane
@@ -147,6 +185,7 @@ class ESP32Connection:
         # payload). v2/v3 add a BinaryProtocol header that this gateway
         # does not yet wrap — see Issue follow-up to #70.
         self.protocol_version: int = 1
+        self.features: dict[str, Any] = {}
 
     @property
     def connected(self) -> bool:
@@ -329,7 +368,7 @@ class ESP32Connection:
             if not future.done():
                 future.set_result(payload)
         else:
-            # Notification (no id) — log and discard for now
+            # Notification (no id), or unmatched response — log and discard.
             method = payload.get("method", "")
             logger.info("ESP32 notification: %s", method)
 
@@ -444,6 +483,52 @@ class ESP32Connection:
         self._avatar_set_waiters.clear()
 
 
+class CameraMediaConnection:
+    """One device-owned WebSocket used only for camera session control."""
+
+    def __init__(
+        self,
+        ws: ServerConnection,
+        *,
+        device_id: str,
+        datagram_session: CameraDatagramSession | None = None,
+        control: ESP32Connection | None = None,
+    ):
+        self._ws = ws
+        self.device_id = device_id
+        self.datagram_session = datagram_session
+        self.control = control
+        self._connected = True
+        self._send_lock = asyncio.Lock()
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    async def send_datagram_config(self, *, port: int, host: str = "") -> None:
+        session = self.datagram_session
+        if not self._connected or session is None:
+            raise ConnectionError("Camera datagram session is not connected")
+        async with self._send_lock:
+            config = {
+                "type": "camera_datagram_config",
+                "version": 1,
+                "port": port,
+                "maxDatagramBytes": SCU1_MAX_DATAGRAM_BYTES,
+                "token": session.token.hex(),
+            }
+            if host:
+                config["host"] = host
+            await self._ws.send(json.dumps(config))
+
+    async def close(self) -> None:
+        self._connected = False
+        await self._ws.close()
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+
 class ESP32Manager:
     """Manages ESP32 device connections.
 
@@ -453,9 +538,37 @@ class ESP32Manager:
 
     def __init__(self, notify_config: NotifyConfig | None = None):
         self._connection: ESP32Connection | None = None
+        self._camera_connection: CameraMediaConnection | None = None
         self._server: Any = None
+        self._camera_datagram_endpoint: CameraDatagramEndpoint | None = None
+        self._camera_datagram_port = 0
+        self._camera_datagram_host = ""
+        self._camera_datagram_sessions: dict[bytes, CameraDatagramSession] = {}
+        self._last_camera_datagram_status: dict[str, int | bool] = {
+            "ready": False,
+            "pending": False,
+            "completed_frames": 0,
+            "replaced_incomplete_frames": 0,
+            "stale_chunks": 0,
+            "expired_frames": 0,
+            "invalid_frames": 0,
+            "source_mismatch_packets": 0,
+        }
+        self._camera_credit_task: asyncio.Task[None] | None = None
+        self._camera_frame_tasks: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
+        self._camera_lock = asyncio.Lock()
+        self._camera_ready_lock = asyncio.Lock()
+        self._camera_ready_pair: (
+            tuple[ESP32Connection, CameraMediaConnection] | None
+        ) = None
         self._notify_config = notify_config or load_notify_config()
+        self.camera_frames = LatestCameraFrameStore()
+        self.camera_stream = CameraStreamService(self, self.camera_frames)
+        self.head_target_lane = HeadTargetLane(
+            self,
+            device_call_timeout_seconds=RESPONSE_TIMEOUT,
+        )
         self._init_tasks: list[asyncio.Task] = []
         self._vision_url: str = ""
         self._vision_token: str = ""
@@ -506,6 +619,7 @@ class ESP32Manager:
         self._device_driven_session_id: str | None = None
         self._tool_lane_locks = {
             "servo": asyncio.Lock(),
+            "servo_telemetry": asyncio.Lock(),
             "wifi": asyncio.Lock(),
             "led": asyncio.Lock(),
             "port_b": asyncio.Lock(),
@@ -518,6 +632,7 @@ class ESP32Manager:
             "status": asyncio.Lock(),
             "default": asyncio.Lock(),
         }
+        self._head_target_lane_connection: ESP32Connection | None = None
 
     def set_notify_config(self, notify_config: NotifyConfig) -> None:
         """Replace the startup notification config used for future events."""
@@ -530,6 +645,22 @@ class ESP32Manager:
     @property
     def connection(self) -> ESP32Connection | None:
         return self._connection
+
+    @property
+    def supports_camera_stream(self) -> bool:
+        connection = self._connection
+        camera_connection = self._camera_connection
+        return bool(
+            connection is not None
+            and connection.connected
+            and connection.features.get("camera_stream") is True
+            and connection.features.get("camera_datagram_v1") is True
+            and camera_connection is not None
+            and camera_connection.connected
+            and camera_connection.device_id == connection.device_id
+            and camera_connection.datagram_session is not None
+            and camera_connection.datagram_session.ready
+        )
 
     @property
     def tts_lock(self) -> asyncio.Lock:
@@ -559,12 +690,17 @@ class ESP32Manager:
         vision_token: str = "",
         audio_hook_url: str = "",
         audio_hook_token: str = "",
+        camera_datagram_host: str = "",
     ) -> None:
         """Start the WebSocket server for ESP32 connections."""
+        token = os.getenv("STACKCHAN_TOKEN") or os.getenv("BEARER_TOKEN")
+        if not token and not _is_loopback_bind_host(host):
+            raise ValueError(NON_LOOPBACK_TOKEN_REQUIRED_MESSAGE)
         self._vision_url = vision_url
         self._vision_token = vision_token
         self._audio_hook_url = audio_hook_url
         self._audio_hook_token = audio_hook_token
+        self._camera_datagram_host = camera_datagram_host
         if audio_hook_url:
             logger.info(
                 "Device-driven listen capture enabled (audio hook %s)",
@@ -586,9 +722,113 @@ class ESP32Manager:
             ping_interval=WEBSOCKET_PING_INTERVAL_S,
             ping_timeout=WEBSOCKET_PING_TIMEOUT_S,
         )
+        loop = asyncio.get_running_loop()
+        udp_bind_port = port if port != 0 else 0
+        try:
+            transport, endpoint = await loop.create_datagram_endpoint(
+                lambda: CameraDatagramEndpoint(self._on_camera_datagram),
+                local_addr=(host, udp_bind_port),
+            )
+        except BaseException:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+            raise
+        self._camera_datagram_endpoint = endpoint
+        sockname = transport.get_extra_info("sockname")
+        self._camera_datagram_port = int(sockname[1])
+
+    def _on_camera_datagram(
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+    ) -> None:
+        token = peek_token(data)
+        if token is None:
+            return
+        session = self._camera_datagram_sessions.get(token)
+        if session is None:
+            return
+        completed = session.accept(data, addr, now_ms=int(_monotonic() * 1_000))
+        if completed is not None:
+            task = asyncio.create_task(
+                self._handle_camera_datagram_frame(completed, session=session)
+            )
+            self._track_camera_frame_task(task)
+
+    def _track_camera_frame_task(self, task: asyncio.Task[None]) -> None:
+        self._camera_frame_tasks.add(task)
+        task.add_done_callback(self._camera_frame_task_completed)
+
+    def _camera_frame_task_completed(self, task: asyncio.Task[None]) -> None:
+        self._camera_frame_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("camera frame processing failed: %s", error)
+
+    async def _handle_camera_datagram_frame(
+        self,
+        payload: bytes,
+        *,
+        session: CameraDatagramSession,
+    ) -> None:
+        connection = self._connection
+        media = self._camera_connection
+        if (
+            connection is None
+            or not connection.connected
+            or media is None
+            or not media.connected
+            or media.datagram_session is not session
+            or media.device_id != connection.device_id
+            or not self.camera_stream.can_accept_frames()
+        ):
+            return
+        try:
+            frame = parse_camera_frame(
+                payload,
+                max_frame_bytes=MAX_CAMERA_FRAME_BYTES,
+            )
+        except CameraFrameProtocolError as exc:
+            logger.warning("invalid SCL1 camera datagram frame: %s", exc)
+            return
+        if frame is None or frame.device_id != connection.device_id:
+            logger.warning(
+                "camera datagram identity mismatch: device=%s",
+                connection.device_id,
+            )
+            return
+        await self.camera_frames.publish(frame)
 
     async def stop(self) -> None:
         """Stop the WebSocket server."""
+        try:
+            await self.head_target_lane.stop()
+        except Exception as exc:
+            logger.warning("head target lane shutdown cleanup failed: %s", exc)
+        try:
+            await self.camera_stream.stop_all()
+        except Exception as exc:
+            logger.warning("camera stream shutdown cleanup failed: %s", exc)
+        await self.end_camera_datagram_stream()
+        frame_tasks = tuple(self._camera_frame_tasks)
+        for task in frame_tasks:
+            task.cancel()
+        if frame_tasks:
+            await asyncio.gather(*frame_tasks, return_exceptions=True)
+        async with self._camera_lock:
+            camera_connection = self._camera_connection
+            self._camera_connection = None
+        if camera_connection is not None:
+            await camera_connection.close()
+        for session in tuple(self._camera_datagram_sessions.values()):
+            self._retire_camera_datagram_session(session)
+        if self._camera_datagram_endpoint is not None:
+            self._camera_datagram_endpoint.close()
+            self._camera_datagram_endpoint = None
+            self._camera_datagram_port = 0
         # Cancel any pending initialization tasks
         for task in self._init_tasks:
             task.cancel()
@@ -598,6 +838,103 @@ class ESP32Manager:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+
+    async def begin_camera_datagram_stream(self) -> None:
+        await self.end_camera_datagram_stream()
+        media = self._camera_connection
+        endpoint = self._camera_datagram_endpoint
+        if (
+            media is None
+            or not media.connected
+            or media.datagram_session is None
+            or not media.datagram_session.ready
+            or endpoint is None
+        ):
+            raise ConnectionError("camera datagram session is not ready")
+        session = media.datagram_session
+        session.begin_stream()
+        session.send_credit(endpoint, 4)
+        self._camera_credit_task = asyncio.create_task(
+            self._camera_credit_loop(session, endpoint)
+        )
+
+    async def _camera_credit_loop(
+        self,
+        session: CameraDatagramSession,
+        endpoint: CameraDatagramEndpoint,
+    ) -> None:
+        while session.ready:
+            await asyncio.sleep(CAMERA_DATAGRAM_CREDIT_INTERVAL_S)
+            if not session.ready:
+                return
+            session.send_credit(endpoint, 4)
+
+    async def end_camera_datagram_stream(self) -> None:
+        media = self._camera_connection
+        if media is not None and media.datagram_session is not None:
+            media.datagram_session.end_stream()
+        task = self._camera_credit_task
+        self._camera_credit_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _detach_camera_media(self, control: ESP32Connection) -> None:
+        """Close and retire camera media owned by a departing control."""
+        async with self._camera_lock:
+            media = self._camera_connection
+            if media is None or media.device_id != control.device_id:
+                return
+            if media.control is not None and media.control is not control:
+                return
+            self._camera_connection = None
+
+        session = media.datagram_session
+        if session is not None:
+            session.end_stream()
+            self._retire_camera_datagram_session(session)
+        task = self._camera_credit_task
+        self._camera_credit_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        async with self._camera_ready_lock:
+            if (
+                self._camera_ready_pair is not None
+                and self._camera_ready_pair[1] is media
+            ):
+                self._camera_ready_pair = None
+        await media.close()
+
+    def camera_datagram_status(self) -> dict[str, int | bool]:
+        media = self._camera_connection
+        if (
+            media is not None
+            and media.datagram_session is not None
+            and media.datagram_session.ready
+        ):
+            return media.datagram_session.status()
+        return dict(self._last_camera_datagram_status)
+
+    def _retire_camera_datagram_session(
+        self,
+        session: CameraDatagramSession,
+    ) -> None:
+        if self._camera_datagram_sessions.get(session.token) is not session:
+            session.close()
+            return
+        status = session.status()
+        status["ready"] = False
+        self._last_camera_datagram_status = status
+        self._camera_datagram_sessions.pop(session.token, None)
+        session.close()
 
     def _check_auth(
         self, connection: ServerConnection, request: websockets.http11.Request
@@ -627,10 +964,21 @@ class ESP32Manager:
         MCP responses to pending futures. Initialization (initialize + tools/list)
         runs as a separate task so it doesn't block the read loop.
         """
+        if (
+            ws.request is not None
+            and ws.request.headers.get("Camera-Stream", "") == "1"
+        ):
+            await self._camera_handler(ws)
+            return
+
         session_id = str(uuid.uuid4())
         device_id = (
-            ws.request.headers.get("Device-Id", "unknown") if ws.request else "unknown"
+            ws.request.headers.get("Device-Id", "").strip() if ws.request else ""
         )
+        if not device_id:
+            logger.warning("ESP32 control connection rejected without Device-Id")
+            await ws.close(code=1008, reason="Device-Id required")
+            return
         logger.info("ESP32 connecting: device=%s", device_id)
 
         connection = ESP32Connection(ws, session_id)
@@ -643,14 +991,11 @@ class ESP32Manager:
             async for message in ws:
                 last_frame_received_at = _monotonic()
                 if isinstance(message, bytes):
-                    # Binary = audio frame. Forward to the audio_stream
-                    # module which buffers it for STT capture (Issue
-                    # #91) when a recording slot is open, or discards
-                    # it otherwise. Only protocol v1 is supported on
-                    # the inbound side today; the orchestrator gates
-                    # listen() on protocol_version=1 so v2/v3 frames
-                    # cannot reach this point with recording active.
-                    await handle_audio_frame(message, session_id)
+                    await self._handle_binary_message(
+                        connection,
+                        message,
+                        session_id,
+                    )
                     continue
 
                 try:
@@ -668,6 +1013,9 @@ class ESP32Manager:
                         logger.warning("ESP32 does not support MCP, rejecting")
                         await ws.close()
                         return
+                    connection.features = (
+                        dict(features) if isinstance(features, dict) else {}
+                    )
 
                     # Capture the device's WebSocket protocol version
                     # so callers (e.g. the TTS pipeline) can decide
@@ -690,16 +1038,16 @@ class ESP32Manager:
                             connection.protocol_version,
                         )
 
-                    # Send hello response
+                    # Register before acknowledging hello. The firmware opens
+                    # its dedicated media socket as soon as this response is
+                    # received, so acknowledging first creates a race where
+                    # the correctly authenticated media socket has no control
+                    # connection to attach to yet.
+                    if not await self._register_connection(connection):
+                        return
+
                     resp = HelloResponse(session_id=session_id)
                     await ws.send(resp.model_dump_json())
-
-                    # Register connection
-                    async with self._lock:
-                        if self._connection and self._connection.connected:
-                            logger.warning("Replacing existing ESP32 connection")
-                            self._connection.disconnect()
-                        self._connection = connection
 
                     # Start initialization as a separate task so the read loop
                     # continues to pump messages (responses to initialize/tools_list)
@@ -850,9 +1198,227 @@ class ESP32Manager:
                 # the slot, then keep going.
                 self._device_driven_session_id = None
             connection.disconnect()
+            active_connection_detached = False
             async with self._lock:
                 if self._connection is connection:
                     self._connection = None
+                    active_connection_detached = True
+            if active_connection_detached:
+                async with self._camera_ready_lock:
+                    if (
+                        self._camera_ready_pair is not None
+                        and self._camera_ready_pair[0] is connection
+                    ):
+                        self._camera_ready_pair = None
+                try:
+                    await self.head_target_lane.stop()
+                except Exception as exc:
+                    logger.warning(
+                        "head target lane disconnect cleanup failed: %s",
+                        exc,
+                    )
+                try:
+                    await self.camera_stream.on_device_disconnected()
+                except Exception as exc:
+                    logger.warning(
+                        "camera stream disconnect cleanup failed: %s",
+                        exc,
+                    )
+                try:
+                    await self._detach_camera_media(connection)
+                except Exception as exc:
+                    logger.warning(
+                        "camera media disconnect cleanup failed: %s",
+                        exc,
+                    )
+
+    async def _camera_handler(self, ws: ServerConnection) -> None:
+        """Authenticate camera setup while JPEG frames travel only over UDP."""
+        device_id = (
+            ws.request.headers.get("Device-Id", "").strip() if ws.request else ""
+        )
+        if not device_id:
+            logger.warning("Camera media connection rejected without Device-Id")
+            await ws.close(code=1008, reason="Device-Id required")
+            return
+        control = self._connection
+        if control is None or not control.connected or control.device_id != device_id:
+            logger.warning(
+                "Camera media connection rejected without matching control: device=%s",
+                device_id,
+            )
+            await ws.close(code=1008, reason="Matching control connection required")
+            return
+
+        remote_address = ws.remote_address
+        if remote_address is None or not isinstance(remote_address[0], str):
+            logger.warning("Camera media connection has no source address")
+            await ws.close(code=1011, reason="Source address unavailable")
+            return
+        datagram_session = CameraDatagramSession(
+            token=secrets.token_bytes(16),
+            expected_ip=None if self._camera_datagram_host else remote_address[0],
+        )
+        media = CameraMediaConnection(
+            ws,
+            device_id=device_id,
+            datagram_session=datagram_session,
+            control=control,
+        )
+        self._camera_datagram_sessions[datagram_session.token] = datagram_session
+        async with self._camera_lock:
+            previous = self._camera_connection
+            self._camera_connection = media
+        if previous is not None:
+            await previous.close()
+
+        detached = False
+        try:
+            await media.send_datagram_config(
+                port=self._camera_datagram_port,
+                host=self._camera_datagram_host,
+            )
+            await datagram_session.wait_ready(timeout_s=1.0)
+            logger.info("Camera datagram media connected: device=%s", device_id)
+            await self._ensure_camera_stream_ready(control)
+            async for message in ws:
+                if isinstance(message, bytes):
+                    logger.warning(
+                        "camera WebSocket binary ignored after UDP negotiation: device=%s",
+                        device_id,
+                    )
+                else:
+                    logger.debug(
+                        "Camera media text frame ignored: device=%s",
+                        device_id,
+                    )
+        except TimeoutError:
+            logger.warning("Camera datagram hello timed out: device=%s", device_id)
+            await ws.close(code=1013, reason="Camera datagram hello timeout")
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            media.disconnect()
+            self._retire_camera_datagram_session(datagram_session)
+            async with self._camera_lock:
+                if self._camera_connection is media:
+                    self._camera_connection = None
+                    detached = True
+            if detached:
+                async with self._camera_ready_lock:
+                    if (
+                        self._camera_ready_pair is not None
+                        and self._camera_ready_pair[1] is media
+                    ):
+                        self._camera_ready_pair = None
+                logger.info("Camera media disconnected: device=%s", device_id)
+                try:
+                    await self.camera_stream.on_device_disconnected()
+                except Exception as exc:
+                    logger.warning("camera media disconnect cleanup failed: %s", exc)
+
+    async def _ensure_camera_stream_ready(
+        self,
+        control: ESP32Connection,
+    ) -> None:
+        """Run reconnect recovery once for one initialized control/media pair."""
+        async with self._camera_ready_lock:
+            media = self._camera_connection
+            if (
+                control is not self._connection
+                or not control.connected
+                or not control.initialized
+                or not control.tools_discovered
+                or media is None
+                or not media.connected
+                or media.device_id != control.device_id
+                or media.datagram_session is None
+                or not media.datagram_session.ready
+            ):
+                return
+            pair = (control, media)
+            if self._camera_ready_pair == pair:
+                return
+            try:
+                await self.camera_stream.on_device_ready()
+            except Exception as exc:
+                logger.error(
+                    "camera stream pair recovery failed: device=%s error=%s",
+                    control.device_id,
+                    exc,
+                )
+                return
+            if control is self._connection and media is self._camera_connection:
+                self._camera_ready_pair = pair
+
+    async def _register_connection(
+        self,
+        connection: ESP32Connection,
+    ) -> bool:
+        """Replace the active device only after its owned lanes have drained."""
+        async with self._lock:
+            existing = self._connection
+
+        if existing is not None:
+            if existing.connected:
+                logger.warning("Replacing existing ESP32 connection")
+            try:
+                await self.head_target_lane.stop()
+            except Exception as exc:
+                logger.warning(
+                    "head target lane replacement cleanup failed: %s",
+                    exc,
+                )
+            try:
+                await self.camera_stream.on_device_disconnected()
+            except Exception as exc:
+                logger.warning(
+                    "camera stream replacement cleanup failed: %s",
+                    exc,
+                )
+            try:
+                await self._detach_camera_media(existing)
+            except Exception as exc:
+                logger.warning(
+                    "camera media replacement cleanup failed: %s",
+                    exc,
+                )
+            existing.disconnect()
+
+        async with self._lock:
+            if self._connection not in (None, existing):
+                connection.disconnect()
+                return False
+            self._connection = connection
+            return True
+
+    async def _handle_binary_message(
+        self,
+        connection: ESP32Connection,
+        message: bytes,
+        session_id: str,
+    ) -> None:
+        """Demultiplex SCL1 camera frames from protocol-v1 raw Opus."""
+        try:
+            frame = parse_camera_frame(
+                message,
+                max_frame_bytes=MAX_CAMERA_FRAME_BYTES,
+            )
+        except CameraFrameProtocolError as exc:
+            logger.warning("invalid SCL1 camera frame: %s", exc)
+            return
+
+        if frame is None:
+            # Existing protocol-v1 audio path: one raw Opus packet per binary
+            # WebSocket message. Camera framing is deliberately additive so
+            # audio behavior and its recording-session guards stay unchanged.
+            await handle_audio_frame(message, session_id)
+            return
+
+        logger.warning(
+            "camera frame dropped on control WebSocket: session=%s",
+            session_id,
+        )
 
     async def _init_device(self, connection: ESP32Connection, device_id: str) -> None:
         """Initialize MCP session with a newly connected device."""
@@ -865,6 +1431,7 @@ class ESP32Manager:
                 logger.error("ESP32 tools discovery failed")
                 return
             await self._auto_render_idle_avatar(connection, device_id)
+            await self._ensure_camera_stream_ready(connection)
             logger.info(
                 "ESP32 ready: device=%s tools=%d",
                 device_id,
@@ -1024,6 +1591,55 @@ class ESP32Manager:
                     "stackchan-event log persistence raised unexpectedly: %s", exc
                 )
 
+    async def acquire_head_target_lane(self) -> None:
+        """Reserve the servo lane for the bounded head-target pipeline."""
+        servo_lock = self._tool_lane_locks["servo"]
+        await servo_lock.acquire()
+        connection = self._connection
+        if connection is None or not connection.connected or not connection.initialized:
+            servo_lock.release()
+            raise RuntimeError("ESP32 is unavailable for head target lane")
+        self._head_target_lane_connection = connection
+
+    async def release_head_target_lane(self) -> None:
+        """Release a previously acquired head-target servo reservation."""
+        if self._head_target_lane_connection is None:
+            raise RuntimeError("head target lane servo reservation is missing")
+        self._head_target_lane_connection = None
+        self._tool_lane_locks["servo"].release()
+
+    async def read_head_target_pose(self) -> ToolCallResult:
+        """Read the non-blocking interpolator pose that seeds the head lane."""
+        return await self._call_reserved_head_target_tool(
+            "self.robot.get_head_angles",
+            {"cached_motion_state": True},
+        )
+
+    async def call_head_target_tool(
+        self,
+        arguments: dict[str, Any],
+    ) -> ToolCallResult:
+        """Pipeline one set-head request on the reserved servo connection."""
+        return await self._call_reserved_head_target_tool(
+            "self.robot.set_head_angles",
+            arguments,
+        )
+
+    async def _call_reserved_head_target_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> ToolCallResult:
+        connection = self._head_target_lane_connection
+        if connection is None:
+            return None, {
+                "code": -32000,
+                "message": "Head target lane servo reservation is inactive",
+            }
+        if connection is not self._connection or not connection.connected:
+            return None, {"code": -32000, "message": "ESP32 not connected"}
+        return await connection.call_tool(name, arguments)
+
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> ToolCallResult:
@@ -1069,7 +1685,7 @@ class ESP32Manager:
         name: str,
         arguments: dict[str, Any],
     ) -> ToolCallResult:
-        lane = _hardware_lane(name)
+        lane = _hardware_lane(name, arguments)
         lock = self._tool_lane_locks[lane]
         async with lock:
             if connection is not self._connection or not connection.connected:

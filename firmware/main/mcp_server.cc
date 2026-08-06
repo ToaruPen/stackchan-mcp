@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "camera_stream_protocol.h"
 
 #define TAG "MCP"
 
@@ -117,6 +118,56 @@ void McpServer::AddCommonTools() {
                 }
                 auto question = properties["question"].value<std::string>();
                 return camera->Explain(question);
+            });
+
+    }
+#endif
+
+#if CONFIG_BOARD_TYPE_STACKCHAN
+    auto stream_camera = board.GetCamera();
+    if (stream_camera) {
+        AddTool("self.camera.start_stream",
+            "Start the credit-controlled JPEG camera stream.",
+            PropertyList({
+                Property("fps", kPropertyTypeInteger, 15, 1, 20),
+                Property("quality", kPropertyTypeInteger, 60, 1, 100)
+            }),
+            [stream_camera](const PropertyList& properties) -> ReturnValue {
+                const int fps = properties["fps"].value<int>();
+                const int quality = properties["quality"].value<int>();
+                const bool started = stream_camera->StartStream(
+                    fps,
+                    quality,
+                    [](const CameraStreamMetadata& metadata,
+                       const uint8_t* jpeg,
+                       size_t jpeg_size) {
+                        Application::GetInstance().SendCameraJpeg(
+                            metadata,
+                            jpeg,
+                            jpeg_size
+                        );
+                    }
+                );
+                if (!started) {
+                    throw std::runtime_error("Camera stream is unavailable");
+                }
+                return true;
+            });
+
+        AddTool("self.camera.stop_stream",
+            "Stop the JPEG camera stream and discard pending frames.",
+            PropertyList(),
+            [stream_camera](const PropertyList&) -> ReturnValue {
+                stream_camera->StopStream();
+                Application::GetInstance().QuiesceCameraPackets();
+                return true;
+            });
+
+        AddTool("self.camera.stream_status",
+            "Get the current JPEG camera stream status.",
+            PropertyList(),
+            [stream_camera](const PropertyList&) -> ReturnValue {
+                return stream_camera->GetStreamStatus();
             });
     }
 #endif
@@ -436,20 +487,52 @@ void McpServer::ParseMessage(const cJSON* json) {
 }
 
 void McpServer::ReplyResult(int id, const std::string& result) {
+    ReplyResult(id, result, false);
+}
+
+void McpServer::ReplyResultFromMainTask(int id, const std::string& result) {
+    ReplyResult(id, result, true);
+}
+
+void McpServer::ReplyResult(
+    int id,
+    const std::string& result,
+    bool from_main_task) {
     std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
     payload += std::to_string(id) + ",\"result\":";
     payload += result;
     payload += "}";
-    Application::GetInstance().SendMcpMessage(payload);
+    auto& app = Application::GetInstance();
+    if (from_main_task) {
+        app.SendMcpMessageFromMainTask(payload);
+    } else {
+        app.SendMcpMessage(payload);
+    }
 }
 
 void McpServer::ReplyError(int id, const std::string& message) {
+    ReplyError(id, message, false);
+}
+
+void McpServer::ReplyErrorFromMainTask(int id, const std::string& message) {
+    ReplyError(id, message, true);
+}
+
+void McpServer::ReplyError(
+    int id,
+    const std::string& message,
+    bool from_main_task) {
     std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
     payload += std::to_string(id);
     payload += ",\"error\":{\"message\":\"";
-    payload += message;
+    payload += camera_stream_protocol::EscapeJsonString(message);
     payload += "\"}}";
-    Application::GetInstance().SendMcpMessage(payload);
+    auto& app = Application::GetInstance();
+    if (from_main_task) {
+        app.SendMcpMessageFromMainTask(payload);
+    } else {
+        app.SendMcpMessage(payload);
+    }
 }
 
 void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_only_tools) {
@@ -508,7 +591,10 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     ReplyResult(id, json);
 }
 
-void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments) {
+void McpServer::DoToolCall(
+    int id,
+    const std::string& tool_name,
+    const cJSON* tool_arguments) {
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 
                                      return tool->name() == tool_name; 
@@ -581,12 +667,18 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
     // Use main thread to call the tool
     auto& app = Application::GetInstance();
-    app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
+    app.Schedule([
+        this,
+        id,
+        tool_iter,
+        arguments = std::move(arguments)
+    ]() {
         try {
-            ReplyResult(id, (*tool_iter)->Call(arguments));
+            std::string result = (*tool_iter)->Call(arguments);
+            ReplyResultFromMainTask(id, result);
         } catch (const std::exception& e) {
             ESP_LOGE(TAG, "tools/call: %s", e.what());
-            ReplyError(id, e.what());
+            ReplyErrorFromMainTask(id, e.what());
         }
     });
 }

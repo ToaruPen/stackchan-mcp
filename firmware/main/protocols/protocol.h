@@ -79,6 +79,13 @@ public:
     virtual bool IsTransportConnected() const { return false; }
     virtual std::string GetConnectedUrl() const { return ""; }
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
+    virtual bool SendCameraPacket(
+        uint32_t sequence,
+        const uint8_t* data,
+        size_t size
+    ) {
+        return false;
+    }
     virtual void SendWakeWordDetected(const std::string& wake_word);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();

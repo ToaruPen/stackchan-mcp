@@ -57,6 +57,31 @@ def test_create_server():
 
 
 @pytest.mark.asyncio
+async def test_gimbal_surface_matches_current_firmware_controls():
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tool_names = {tool.name for tool in result.root.tools}
+    assert {
+        "get_auto_sleep",
+        "set_auto_sleep",
+    } <= tool_names
+    assert "set_native_write_diagnostics" not in tool_names
+    assert "get_native_write_telemetry" not in tool_names
+    assert tool_names.isdisjoint(
+        {
+            "set_imu_motion_observer",
+            "start_imu_motion_capture",
+            "get_imu_motion_status",
+            "get_imu_motion_telemetry",
+        }
+    )
+
+
+@pytest.mark.asyncio
 async def test_list_tools_includes_get_head_angles():
     """get_head_angles is exposed to MCP clients."""
     server = create_server()
@@ -67,6 +92,503 @@ async def test_list_tools_includes_get_head_angles():
 
     tool_names = [tool.name for tool in result.root.tools]
     assert "get_head_angles" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_camera_device_stream_status_relays_to_firmware(monkeypatch):
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {"running": True, "frames": 17, "encodeFailures": 0}
+                        ),
+                    }
+                ]
+            }, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+    tools = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+    assert "get_camera_device_stream_status" in {
+        tool.name for tool in tools.root.tools
+    }
+
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "get_camera_device_stream_status", "arguments": {}},
+        )
+    )
+
+    assert json.loads(result.root.content[0].text) == {
+        "running": True,
+        "frames": 17,
+        "encodeFailures": 0,
+    }
+    assert calls == [("self.camera.stream_status", {})]
+
+
+@pytest.mark.asyncio
+async def test_list_tools_excludes_removed_native_write_diagnostics():
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tool_names = {tool.name for tool in result.root.tools}
+    assert "set_native_write_diagnostics" not in tool_names
+    assert "get_native_write_telemetry" not in tool_names
+    assert "get_auto_torque_release" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_removed_native_write_diagnostics_are_rejected_without_relay(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {
+                "content": [{"type": "text", "text": json.dumps({"ok": True})}]
+            }, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+    for name in (
+        "set_native_write_diagnostics",
+        "get_native_write_telemetry",
+    ):
+        result = await server.request_handlers[CallToolRequest](
+            CallToolRequest(
+                method="tools/call",
+                params={"name": name, "arguments": {}},
+            )
+        )
+        assert result.root.isError is False
+        assert json.loads(result.root.content[0].text) == {
+            "error": f"Unknown tool: {name}",
+        }
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_torque_release_status_relays_without_bus_io(monkeypatch):
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"enabled": True, "timeout_ms": 5000}),
+                    }
+                ]
+            }, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+    tools = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+    assert "get_auto_torque_release" in {tool.name for tool in tools.root.tools}
+
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "get_auto_torque_release", "arguments": {}},
+        )
+    )
+
+    assert json.loads(result.root.content[0].text) == {
+        "enabled": True,
+        "timeout_ms": 5000,
+    }
+    assert calls == [("self.robot.get_auto_torque_release", {})]
+
+
+@pytest.mark.asyncio
+async def test_auto_sleep_tools_have_exact_schemas_and_passthrough(monkeypatch):
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            if name == "self.power.get_auto_sleep":
+                payload = {
+                    "enabled": False,
+                    "persistence": "nvs",
+                    "sleep_after_s": 60,
+                    "shutdown_after_s": 300,
+                }
+            else:
+                payload = {
+                    "ok": True,
+                    "previous_enabled": False,
+                    "enabled": True,
+                    "takes_effect": "immediate",
+                    "persistence": "nvs",
+                }
+            return {"content": [{"type": "text", "text": json.dumps(payload)}]}, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+    listed = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+    tools = {tool.name: tool for tool in listed.root.tools}
+
+    assert tools["get_auto_sleep"].inputSchema == {
+        "type": "object",
+        "properties": {},
+    }
+    assert tools["set_auto_sleep"].inputSchema == {
+        "type": "object",
+        "properties": {"enabled": {"type": "boolean"}},
+        "required": ["enabled"],
+    }
+
+    get_result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "get_auto_sleep", "arguments": {}},
+        )
+    )
+    set_result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "set_auto_sleep", "arguments": {"enabled": True}},
+        )
+    )
+
+    assert json.loads(get_result.root.content[0].text) == {
+        "enabled": False,
+        "persistence": "nvs",
+        "sleep_after_s": 60,
+        "shutdown_after_s": 300,
+    }
+    assert json.loads(set_result.root.content[0].text) == {
+        "ok": True,
+        "previous_enabled": False,
+        "enabled": True,
+        "takes_effect": "immediate",
+        "persistence": "nvs",
+    }
+    assert calls == [
+        ("self.power.get_auto_sleep", {}),
+        ("self.power.set_auto_sleep", {"enabled": True}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_sleep_device_error_is_returned_once_without_retry(monkeypatch):
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return None, {"message": "NVS read failed"}
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "get_auto_sleep", "arguments": {}},
+        )
+    )
+
+    assert json.loads(result.root.content[0].text) == {"error": "NVS read failed"}
+    assert calls == [("self.power.get_auto_sleep", {})]
+
+
+@pytest.mark.asyncio
+async def test_list_tools_includes_camera_stream_lifecycle_schema():
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tools = {tool.name: tool for tool in result.root.tools}
+    stream = tools["camera_stream"]
+    assert stream.inputSchema == {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "stop", "status"],
+                "default": "status",
+            },
+            "fps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 20,
+            },
+            "quality": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 60,
+            },
+        },
+    }
+    assert "memory" in stream.description
+    assert "disk" in stream.description
+
+
+@pytest.mark.asyncio
+async def test_list_tools_includes_head_target_lane_schema():
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tools = {tool.name: tool for tool in result.root.tools}
+    lane = tools["stackchan_head_target_lane"]
+    properties = lane.inputSchema["properties"]
+    assert properties["action"]["enum"] == [
+        "start",
+        "update",
+        "clear",
+        "motion_status",
+        "status",
+        "stop",
+    ]
+    assert properties["rate_hz"]["maximum"] == 10
+    assert properties["max_pending_age_ms"] == {
+        "type": "integer",
+        "minimum": 50,
+        "maximum": 500,
+    }
+    assert lane.inputSchema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_head_target_lane_routes_strict_lifecycle(monkeypatch):
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class HeadTargetLaneLifecycle:
+        async def start(self, **config):
+            calls.append(("start", (config,)))
+            return {"phase": "running", "lease_id": "lease-a"}
+
+        async def update(self, lease_id, sequence, yaw, pitch):
+            calls.append(("update", (lease_id, sequence, yaw, pitch)))
+            return {"accepted": True, "pending_depth": 1}
+
+        async def clear(self, lease_id):
+            calls.append(("clear", (lease_id,)))
+            return {"pending_depth": 0}
+
+        def status(self, lease_id=None):
+            calls.append(("status", (lease_id,)))
+            return {"phase": "running", "lease_id_match": True}
+
+        async def stop(self, lease_id=None):
+            calls.append(("stop", (lease_id,)))
+            return {"phase": "stopped"}
+
+    class ESP32:
+        device_connected = True
+        head_target_lane = HeadTargetLaneLifecycle()
+
+    class Gateway:
+        esp32 = ESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: Gateway())
+    server = create_server()
+
+    requests = [
+        {
+            "action": "start",
+            "rate_hz": 10,
+            "max_step_deg": 4,
+            "max_pending_age_ms": 180,
+            "speed_dps": 90,
+        },
+        {
+            "action": "update",
+            "lease_id": "lease-a",
+            "sequence": 1,
+            "yaw": 4,
+            "pitch": 33,
+        },
+        {"action": "clear", "lease_id": "lease-a"},
+        {"action": "status", "lease_id": "lease-a"},
+        {"action": "stop", "lease_id": "lease-a"},
+    ]
+    responses = []
+    for arguments in requests:
+        result = await server.request_handlers[CallToolRequest](
+            CallToolRequest(
+                method="tools/call",
+                params={
+                    "name": "stackchan_head_target_lane",
+                    "arguments": arguments,
+                },
+            )
+        )
+        responses.append(json.loads(result.root.content[0].text))
+
+    assert [call[0] for call in calls] == [
+        "start",
+        "update",
+        "clear",
+        "status",
+        "stop",
+    ]
+    assert responses[1]["accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_head_target_lane_rejects_action_field_mismatch(monkeypatch):
+    class HeadTargetLaneLifecycle:
+        def status(self, lease_id=None):
+            raise AssertionError("invalid request must not reach the lane")
+
+    class ESP32:
+        device_connected = True
+        head_target_lane = HeadTargetLaneLifecycle()
+
+    class Gateway:
+        esp32 = ESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: Gateway())
+    server = create_server()
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={
+                "name": "stackchan_head_target_lane",
+                "arguments": {
+                    "action": "status",
+                    "lease_id": "lease-a",
+                    "yaw": 4,
+                },
+            },
+        )
+    )
+
+    payload = json.loads(result.root.content[0].text)
+    assert payload == {"error": "unexpected field for action=status: yaw"}
+
+
+@pytest.mark.asyncio
+async def test_camera_stream_tool_routes_lifecycle_without_device_tool_mapping(
+    monkeypatch,
+):
+    calls: list[tuple[str, int | None, int | None]] = []
+
+    class CameraStreamLifecycle:
+        async def acquire(self, *, fps: int, quality: int):
+            calls.append(("start", fps, quality))
+            return {"running": True, "subscribers": 1}
+
+        async def release(self):
+            calls.append(("stop", None, None))
+            return {"running": False, "subscribers": 0}
+
+        def status(self):
+            calls.append(("status", None, None))
+            return {
+                "running": False,
+                "subscribers": 0,
+                "datagram": {
+                    "ready": False,
+                    "completed_frames": 12,
+                    "replaced_incomplete_frames": 1,
+                    "stale_chunks": 2,
+                    "expired_frames": 3,
+                    "invalid_frames": 4,
+                    "source_mismatch_packets": 0,
+                },
+            }
+
+    class ESP32:
+        device_connected = True
+        camera_stream = CameraStreamLifecycle()
+
+    class Gateway:
+        esp32 = ESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: Gateway())
+    server = create_server()
+
+    start = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={
+                "name": "camera_stream",
+                "arguments": {"action": "start", "fps": 15, "quality": 55},
+            },
+        )
+    )
+    status = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "camera_stream", "arguments": {"action": "status"}},
+        )
+    )
+    stop = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "camera_stream", "arguments": {"action": "stop"}},
+        )
+    )
+
+    assert calls == [
+        ("start", 15, 55),
+        ("status", None, None),
+        ("stop", None, None),
+    ]
+    assert json.loads(start.root.content[0].text)["running"] is True
+    status_payload = json.loads(status.root.content[0].text)
+    assert status_payload["running"] is False
+    assert status_payload["datagram"]["completed_frames"] == 12
+    assert "token" not in json.dumps(status_payload).lower()
+    assert json.loads(stop.root.content[0].text)["subscribers"] == 0
 
 
 @pytest.mark.asyncio

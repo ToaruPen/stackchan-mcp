@@ -590,6 +590,90 @@ async def _handle_follow_pose_stream(
     return _follow_pose_text({"ok": True, **status})
 
 
+async def _handle_head_target_lane(
+    gateway: Any,
+    arguments: dict[str, Any],
+) -> list[TextContent]:
+    action = arguments.get("action")
+    allowed_fields = {
+        "start": {
+            "action",
+            "rate_hz",
+            "max_step_deg",
+            "max_pending_age_ms",
+            "speed_dps",
+        },
+        "update": {
+            "action",
+            "lease_id",
+            "sequence",
+            "yaw",
+            "pitch",
+        },
+        "clear": {"action", "lease_id"},
+        "motion_status": {"action", "lease_id"},
+        "status": {"action", "lease_id"},
+        "stop": {"action", "lease_id"},
+    }
+    required_fields = {
+        "start": allowed_fields["start"],
+        "update": allowed_fields["update"],
+        "clear": allowed_fields["clear"],
+        "motion_status": allowed_fields["motion_status"],
+        "status": allowed_fields["status"],
+        "stop": allowed_fields["stop"],
+    }
+    if action not in allowed_fields:
+        return _head_target_lane_error(
+            "action must be one of: start, update, clear, motion_status, status, stop"
+        )
+    unexpected = sorted(set(arguments) - allowed_fields[action])
+    if unexpected:
+        return _head_target_lane_error(
+            f"unexpected field for action={action}: {unexpected[0]}"
+        )
+    missing = sorted(required_fields[action] - set(arguments))
+    if missing:
+        return _head_target_lane_error(
+            f"missing field for action={action}: {missing[0]}"
+        )
+
+    lane = gateway.esp32.head_target_lane
+    try:
+        if action == "start":
+            status = await lane.start(
+                rate_hz=arguments["rate_hz"],
+                max_step_deg=arguments["max_step_deg"],
+                max_pending_age_ms=arguments["max_pending_age_ms"],
+                speed_dps=arguments["speed_dps"],
+            )
+        else:
+            lease_id = arguments["lease_id"]
+            if action == "update":
+                status = await lane.update(
+                    lease_id,
+                    arguments["sequence"],
+                    arguments["yaw"],
+                    arguments["pitch"],
+                )
+            elif action == "clear":
+                status = await lane.clear(lease_id)
+            elif action == "motion_status":
+                status = await lane.motion_status(lease_id)
+            elif action == "status":
+                status = lane.status(lease_id)
+            else:
+                status = await lane.stop(lease_id)
+    except (ConnectionError, RuntimeError, ValueError) as exc:
+        return _head_target_lane_error(str(exc))
+    return _follow_pose_text(status)
+
+
+def _head_target_lane_error(message: str) -> list[TextContent]:
+    bounded = message.replace("\n", " ")[:240]
+    return _follow_pose_text({"error": bounded})
+
+
 async def _handle_follow_led_stream(
     gateway: Any,
     arguments: dict[str, Any],
@@ -846,6 +930,29 @@ async def _dispatch_mcp_tool(
         status = gateway.esp32.get_status()
         return [TextContent(type="text", text=json.dumps(status, indent=2))]
 
+    if name == "camera_stream":
+        action = arguments.get("action", "status")
+        try:
+            if action == "start":
+                status = await gateway.esp32.camera_stream.acquire(
+                    fps=arguments.get("fps", 20),
+                    quality=arguments.get("quality", 60),
+                )
+            elif action == "stop":
+                status = await gateway.esp32.camera_stream.release()
+            elif action == "status":
+                status = gateway.esp32.camera_stream.status()
+            else:
+                raise ValueError("action must be one of: start, stop, status")
+        except (ConnectionError, RuntimeError, ValueError) as exc:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": str(exc)}),
+                )
+            ]
+        return [TextContent(type="text", text=json.dumps(status))]
+
     if name == "say":
         try:
             result = await synthesize_and_send(arguments, gateway=gateway)
@@ -898,6 +1005,9 @@ async def _dispatch_mcp_tool(
 
     if name == "stackchan_follow_pose_stream":
         return await _handle_follow_pose_stream(gateway, arguments)
+
+    if name == "stackchan_head_target_lane":
+        return await _handle_head_target_lane(gateway, arguments)
 
     if name == "stackchan_follow_led_stream":
         return await _handle_follow_led_stream(gateway, arguments)
@@ -1045,6 +1155,10 @@ async def _dispatch_mcp_tool(
             "self.robot.get_head_angles",
             {},
         ),
+        "get_camera_device_stream_status": (
+            "self.camera.stream_status",
+            {},
+        ),
         "gpio_test": (
             "self.robot.gpio_test",
             {},
@@ -1095,6 +1209,18 @@ async def _dispatch_mcp_tool(
         ),
         "set_auto_torque_release": (
             "self.robot.set_auto_torque_release",
+            arguments,
+        ),
+        "get_auto_torque_release": (
+            "self.robot.get_auto_torque_release",
+            {},
+        ),
+        "get_auto_sleep": (
+            "self.power.get_auto_sleep",
+            {},
+        ),
+        "set_auto_sleep": (
+            "self.power.set_auto_sleep",
             arguments,
         ),
         "get_touch_state": (
@@ -1261,6 +1387,36 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["question"],
+                },
+            ),
+            Tool(
+                name="camera_stream",
+                description=(
+                    "Acquire, release, or inspect the StackChan camera stream. "
+                    "Frames stay in bounded gateway memory and are never written "
+                    "to disk. Multiple local consumers share one physical stream."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["start", "stop", "status"],
+                            "default": "status",
+                        },
+                        "fps": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "default": 20,
+                        },
+                        "quality": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 60,
+                        },
+                    },
                 },
             ),
             Tool(
@@ -1462,6 +1618,74 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 },
             ),
             Tool(
+                name="stackchan_head_target_lane",
+                description=(
+                    "Own one asynchronous latest-only StackChan head target "
+                    "lane. Updates replace a single pending absolute target "
+                    "and acknowledge without waiting for the ESP32 servo call. "
+                    "Use one opaque lease across start, update, clear, status, "
+                    "and stop; stop drains the active device call before home."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "start",
+                                "update",
+                                "clear",
+                                "motion_status",
+                                "status",
+                                "stop",
+                            ],
+                        },
+                        "rate_hz": {
+                            "type": "number",
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                        "max_step_deg": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "maximum": 30,
+                        },
+                        "max_pending_age_ms": {
+                            "type": "integer",
+                            "minimum": 50,
+                            "maximum": 500,
+                        },
+                        "speed_dps": {
+                            "type": "integer",
+                            "minimum": 15,
+                            "maximum": 240,
+                        },
+                        "lease_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256,
+                        },
+                        "sequence": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9_007_199_254_740_991,
+                        },
+                        "yaw": {
+                            "type": "integer",
+                            "minimum": -90,
+                            "maximum": 90,
+                        },
+                        "pitch": {
+                            "type": "integer",
+                            "minimum": 5,
+                            "maximum": 85,
+                        },
+                    },
+                    "required": ["action"],
+                },
+            ),
+            Tool(
                 name="stackchan_follow_led_stream",
                 description=(
                     "Subscribes to an arbitrary upstream WebSocket LED-frame "
@@ -1568,6 +1792,17 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
             Tool(
                 name="get_head_angles",
                 description="Get the robot's current head angles: yaw and pitch in degrees.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="get_camera_device_stream_status",
+                description=(
+                    "Read the firmware camera producer counters without "
+                    "capturing a frame or changing the stream lifecycle."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {},
@@ -1897,6 +2132,37 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["enabled", "timeout_ms"],
+                },
+            ),
+            Tool(
+                name="get_auto_torque_release",
+                description=(
+                    "Read the current firmware-side automatic torque-release "
+                    "setting without touching the servo bus. Use this before "
+                    "temporarily disabling auto release for a bounded test."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="get_auto_sleep",
+                description=(
+                    "Read StackChan's persisted automatic display-sleep and "
+                    "PMIC shutdown policy without changing runtime state."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_auto_sleep",
+                description=(
+                    "Persist and immediately apply StackChan's automatic "
+                    "display-sleep and PMIC shutdown policy. Enabling restarts "
+                    "the countdown; disabling wakes the display and cancels "
+                    "shutdown."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": ["enabled"],
                 },
             ),
             Tool(
