@@ -54,6 +54,7 @@ Expected: `package.json`が存在しないため非zeroで失敗し、追加対�
 **Files:**
 - Create: `package.json`
 - Create: `package-lock.json`
+- Modify: `.gitignore`
 - Create: `.secretlintrc.json`
 - Create: `.secretlintignore`
 - Create: `.husky/pre-commit`
@@ -89,7 +90,18 @@ Create `.secretlintrc.json`:
 {
   "rules": [
     {
-      "id": "@secretlint/secretlint-rule-preset-recommend"
+      "id": "@secretlint/secretlint-rule-preset-recommend",
+      "rules": [
+        {
+          "id": "@secretlint/secretlint-rule-basicauth",
+          "options": {
+            "allows": [
+              "https://user:pass@example.com",
+              "https://signer:topsecret@example.com"
+            ]
+          }
+        }
+      ]
     }
   ]
 }
@@ -100,6 +112,13 @@ Create `.secretlintignore`:
 ```text
 # Third-party Git submodule; scan repository-owned files only.
 firmware/components/smooth_ui_toolkit/**
+```
+
+Add to `.gitignore`:
+
+```text
+# Node.js
+node_modules/
 ```
 
 - [ ] **Step 3: repository管理のpre-commit hookを追加する**
@@ -136,7 +155,7 @@ Run:
 ```bash
 set +e
 printf '%s%s\n' 'ghp_' '0123456789abcdefghijklmnopqrstuvwxyz' \
-  | npx secretlint --stdinFileName=secretlint-canary.txt >/tmp/stackchan-secretlint-canary.log 2>&1
+  | npx secretlint --stdinFileName=secretlint-canary.txt
 secretlint_canary_status=$?
 set -e
 test "$secretlint_canary_status" -eq 1
@@ -231,7 +250,7 @@ Expected: firmware host test 89件とgateway lint/testが成功する。
 - [ ] **Step 3: 実装をcommitする**
 
 ```bash
-git add package.json package-lock.json .secretlintrc.json .secretlintignore .husky/pre-commit .github/workflows/build.yml CONTRIBUTING.md
+git add package.json package-lock.json .gitignore .secretlintrc.json .secretlintignore .husky/pre-commit .github/workflows/build.yml CONTRIBUTING.md docs/superpowers/specs/2026-08-08-secretlint-configuration-design.md docs/superpowers/plans/2026-08-08-secretlint-configuration.md
 git commit -m "ci: enforce repository secret scanning"
 ```
 

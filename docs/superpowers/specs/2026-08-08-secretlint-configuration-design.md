@@ -24,6 +24,7 @@ lockfileはnpmで生成し、ローカルとCIは同じ依存グラフを使用�
 |---|---|
 | `package.json` | Node.js要件、固定した開発依存、SecretlintとHuskyのscripts |
 | `package-lock.json` | 再現可能なnpm依存グラフ |
+| `.gitignore` | ローカルに導入した`node_modules`をGit管理から除外 |
 | `.secretlintrc.json` | `@secretlint/secretlint-rule-preset-recommend`の有効化 |
 | `.secretlintignore` | 管理外のfirmwareサブモジュールだけを除外 |
 | `.husky/pre-commit` | commit直前にリポジトリ全体の秘密情報を検査 |
@@ -36,12 +37,17 @@ Secretlint 13の要件に合わせ、CIはNode.js 22を使う。
 
 ## 走査範囲
 
-Secretlint 13は既存の`.gitignore`を既定で尊重する。そのため`.env`、build成果物、
+Secretlint 13は`.gitignore`を既定で尊重する。そのため`.env`、build成果物、
 ローカルsdkconfig、仮想環境などは既存方針のまま除外される。`node_modules`は
-Secretlintの組み込み規則により除外される。
+Secretlintの組み込み規則に加え、Gitの作業treeへ現れないよう`.gitignore`でも除外する。
 `.secretlintignore`にはGit submoduleである
 `firmware/components/smooth_ui_toolkit/**`だけを明記する。所有するソース、文書、
 workflow、lockfileは除外しない。
+
+`gateway/tests/test_cli.py`には、Basic Authを出力前にredactする挙動を検証するための
+ダミーURLが2件ある。ファイル全体は除外せず、Basic Auth子ruleの`allows`へ検出部分の
+完全リテラルだけを登録する。これにより、同じファイル内の別の認証情報は引き続き
+検出される。
 
 ## pre-commit
 

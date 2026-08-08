@@ -7,6 +7,9 @@ venv/
 *.egg-info/
 .pytest_cache/
 
+# Node.js
+node_modules/
+
 # Environment / secrets
 .env
 .env.local

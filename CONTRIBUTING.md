@@ -14,7 +14,15 @@ Install the tools needed for the part of the repository you are changing:
 - Firmware: Docker or a compatible container runtime that can run
   `espressif/idf:v5.5.2`
 - Gateway: Python managed with `uv`
+- Repository tooling: Node.js 22 or newer with npm
 - Hardware testing: M5Stack CoreS3 + official StackChan kit
+
+Install the repository tooling and tracked pre-commit hook from the repository
+root:
+
+```bash
+npm ci
+```
 
 For gateway development:
 
@@ -70,6 +78,7 @@ pushes to `main`. It currently verifies:
 - Firmware: `python ./scripts/release.py stackchan` inside
   `espressif/idf:v5.5.2`
 - Gateway: `uv sync --frozen`, `uv run ruff check .`, and `uv run pytest`
+- Secrets: `npm ci` followed by `npm run secretlint` on Node.js 22
 - CHANGELOG: PR-level enforcement that `CHANGELOG.md` is updated when
   `firmware/` or `gateway/` paths change (see "Changelog entries per PR"
   below)
@@ -77,6 +86,25 @@ pushes to `main`. It currently verifies:
 CI is the shared baseline. For firmware changes, real hardware testing is still
 needed before merge, but contributors without hardware are welcome to open PRs
 and ask for maintainer verification.
+
+## Secret Scanning
+
+Run the repository-wide secret scan from the repository root:
+
+```bash
+npm ci
+npm run secretlint
+```
+
+The npm `prepare` script registers the tracked Husky pre-commit hook, which runs
+the same Secretlint command before every commit. GitHub Actions sets `HUSKY=0`
+to skip hook registration in CI, then runs the scanner explicitly as its own
+job.
+
+Secretlint respects the repository's existing `.gitignore` files. The narrower
+`.secretlintignore` excludes only the third-party
+`firmware/components/smooth_ui_toolkit` submodule; repository-owned source,
+configuration, documentation, and lockfiles remain in scope.
 
 ## Changelog entries per PR
 

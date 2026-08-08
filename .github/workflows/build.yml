@@ -13,6 +13,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  secretlint:
+    name: Secretlint
+    runs-on: ubuntu-latest
+    env:
+      HUSKY: 0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install repository tooling
+        run: npm ci
+
+      - name: Run Secretlint
+        run: npm run secretlint
+
   firmware-build:
     name: Firmware build
     runs-on: ubuntu-latest
