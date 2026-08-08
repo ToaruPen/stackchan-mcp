@@ -128,6 +128,9 @@ def _patch_esp_video_dqbuf_source(source_text: str) -> str:
     if function_end is None:
         raise RuntimeError("esp_video dequeue context changed; update the override")
 
+    if source_text.count("esp_video_recv_element(") != 1:
+        raise RuntimeError("esp_video dequeue source shape changed; update the override")
+
     function_text = source_text[function_start:function_end]
     if function_text.count("esp_video_recv_element(") != 1:
         raise RuntimeError("esp_video dequeue source shape changed; update the override")

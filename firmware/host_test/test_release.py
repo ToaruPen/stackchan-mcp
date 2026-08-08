@@ -140,7 +140,7 @@ class EspVideoDqbufPatchTest(unittest.TestCase):
             release._patch_esp_video_dqbuf_source(source)
 
     def test_dequeue_marker_outside_function_is_rejected(self) -> None:
-        source = _dqbuf_source(wait_expression="UNKNOWN_WAIT") + (
+        source = _dqbuf_source() + (
             "\nstatic void unrelated_function("
             "struct esp_video *video, struct v4l2_buffer *vbuf)\n"
             "{\n"
@@ -148,7 +148,7 @@ class EspVideoDqbufPatchTest(unittest.TestCase):
             "}\n"
         )
 
-        with self.assertRaisesRegex(RuntimeError, "dequeue context changed"):
+        with self.assertRaisesRegex(RuntimeError, "dequeue source shape changed"):
             release._patch_esp_video_dqbuf_source(source)
 
     def test_unknown_extra_dequeue_is_rejected(self) -> None:

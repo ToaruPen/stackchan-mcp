@@ -200,7 +200,7 @@ cd firmware
 python3 -m unittest host_test.test_release.EspVideoDqbufPatchTest -v
 ```
 
-Expected: 3 tests pass。
+Expected: 9 tests pass。
 
 - [x] **Step 4: ホストテスト全体を実行する**
 
