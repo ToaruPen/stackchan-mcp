@@ -79,6 +79,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Configure firmware host tests
         run: cmake -S firmware/host_test -B /tmp/firmware-host-test-build
