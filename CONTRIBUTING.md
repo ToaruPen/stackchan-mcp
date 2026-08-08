@@ -104,7 +104,9 @@ job.
 Secretlint respects the repository's existing `.gitignore` files. The narrower
 `.secretlintignore` excludes only the third-party
 `firmware/components/smooth_ui_toolkit` submodule; repository-owned source,
-configuration, documentation, and lockfiles remain in scope.
+workflow files, documentation, and lockfiles remain in scope. Secretlint's own
+`.secretlintrc*` and `.secretlintignore*` control files are excluded by its
+built-in ignore list.
 
 ## Changelog entries per PR
 

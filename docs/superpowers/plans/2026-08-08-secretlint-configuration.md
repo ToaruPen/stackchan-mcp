@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: 設計と計画を記録する
+## Task 1: 設計と計画を記録する
 
 **Files:**
 - Create: `docs/superpowers/specs/2026-08-08-secretlint-configuration-design.md`
@@ -34,7 +34,7 @@ git add docs/superpowers/specs/2026-08-08-secretlint-configuration-design.md doc
 git commit -m "docs: plan Secretlint enforcement"
 ```
 
-### Task 2: Secretlint不在の失敗を確認する
+## Task 2: Secretlint不在の失敗を確認する
 
 **Files:**
 - Test: repository root command behavior
@@ -49,7 +49,7 @@ npm run secretlint
 
 Expected: `package.json`が存在しないため非zeroで失敗し、追加対象の挙動がまだないことを確認できる。
 
-### Task 3: ルートSecretlintとpre-commitを実装する
+## Task 3: ルートSecretlintとpre-commitを実装する
 
 **Files:**
 - Create: `package.json`
@@ -163,7 +163,7 @@ test "$secretlint_canary_status" -eq 1
 
 Expected: 検出時の規定終了コード1になる。出力は秘密値が既定でmaskされる。
 
-### Task 4: CIとcontributor向け手順を追加する
+## Task 4: CIとcontributor向け手順を追加する
 
 **Files:**
 - Modify: `.github/workflows/build.yml`
@@ -212,7 +212,7 @@ npm run secretlint
 Document that `prepare` installs the tracked Husky hook, CI uses `HUSKY=0`,
 and `.gitignore` plus the narrow `.secretlintignore` define the scan boundary.
 
-### Task 5: 全体検証、commit、PR公開を行う
+## Task 5: 全体検証、commit、PR公開を行う
 
 **Files:**
 - Verify: all changed files
@@ -226,6 +226,7 @@ npm ci
 npm run secretlint
 test -x .husky/pre-commit
 node -e "JSON.parse(require('node:fs').readFileSync('package.json')); JSON.parse(require('node:fs').readFileSync('.secretlintrc.json'))"
+uv sync --project gateway --frozen --extra tts
 gateway/.venv/bin/python -c "import yaml; yaml.safe_load(open('.github/workflows/build.yml', encoding='utf-8'))"
 git diff --check
 ```

@@ -10,9 +10,9 @@ Secretlintの設定、Node.js依存定義、pre-commitフック、CIジョブが
 ## 目的
 
 - 新規cloneで依存を再現可能に導入できるようにする。
-- 開発者が`npm run secretlint`または`npx secretlint .`で全体を検査できるようにする。
+- 開発者が`npm run secretlint`で全体を検査できるようにする。
 - commit前とGitHub Actionsの両方で同じSecretlint設定を強制する。
-- 管理対象のソース、設定、文書は走査し、管理外の第三者コードだけを除外する。
+- 管理対象のソース、workflow、文書、lockfileは走査し、管理外の第三者コードだけを除外する。
 
 ## 採用構成
 
@@ -42,7 +42,8 @@ Secretlint 13は`.gitignore`を既定で尊重する。そのため`.env`、buil
 Secretlintの組み込み規則に加え、Gitの作業treeへ現れないよう`.gitignore`でも除外する。
 `.secretlintignore`にはGit submoduleである
 `firmware/components/smooth_ui_toolkit/**`だけを明記する。所有するソース、文書、
-workflow、lockfileは除外しない。
+workflow、lockfileは除外しない。Secretlint自身の制御ファイルである
+`.secretlintrc*`と`.secretlintignore*`は、Secretlintの組み込みignore対象となる。
 
 `gateway/tests/test_cli.py`には、Basic Authを出力前にredactする挙動を検証するための
 ダミーURLが2件ある。ファイル全体は除外せず、Basic Auth子ruleの`allows`へ検出部分の
