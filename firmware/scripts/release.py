@@ -45,18 +45,7 @@ def merge_bin() -> None:
         sys.exit(1)
 
 
-def apply_esp_video_dqbuf_timeout() -> None:
-    """Apply the tracked StackChan dequeue bound to esp_video 1.3.1."""
-    component_dir = Path("managed_components/espressif__esp_video")
-    manifest = component_dir / "idf_component.yml"
-    source = component_dir / "src/esp_video_ioctl.c"
-    cmake = component_dir / "CMakeLists.txt"
-    if not manifest.exists() or "version: 1.3.1" not in manifest.read_text(
-        encoding="utf-8"
-    ):
-        raise RuntimeError("esp_video 1.3.1 is required for the dequeue override")
-
-    source_text = source.read_text(encoding="utf-8")
+def _patch_esp_video_dqbuf_source(source_text: str) -> str:
     source_include = '#include "esp_video.h"\n#include "esp_video_vfs.h"'
     patched_include = (
         '#include "esp_video.h"\n'
@@ -70,39 +59,124 @@ def apply_esp_video_dqbuf_timeout() -> None:
         "    esp_err_t ret;\n"
         "    struct esp_video_buffer_info info;"
     )
-    legacy_patched_declaration = source_declaration.replace(
-        "    struct esp_video_buffer_info info;",
-        "    uint32_t ticks = pdMS_TO_TICKS(ESP_VIDEO_DQBUF_TIMEOUT_MS);\n"
-        "    struct esp_video_buffer_info info;",
+    tick_declarations = (
+        "    uint32_t ticks = portMAX_DELAY;\n",
+        "    uint32_t ticks = pdMS_TO_TICKS(ESP_VIDEO_DQBUF_TIMEOUT_MS);\n",
     )
     source_dequeue = "esp_video_recv_element(video, vbuf->type, portMAX_DELAY)"
-    legacy_patched_dequeue = "esp_video_recv_element(video, vbuf->type, ticks)"
+    legacy_dequeue = "esp_video_recv_element(video, vbuf->type, ticks)"
     patched_dequeue = (
         "esp_video_recv_element("
         "video, vbuf->type, ESP_VIDEO_DQBUF_WAIT_TICKS)"
     )
-    if source_include in source_text:
-        source_text = source_text.replace(source_include, patched_include, 1)
-    elif patched_include not in source_text:
+    declarations_with_ticks = tuple(
+        source_declaration.replace(
+            "    struct esp_video_buffer_info info;",
+            tick_declaration + "    struct esp_video_buffer_info info;",
+        )
+        for tick_declaration in tick_declarations
+    )
+    source_shapes = (
+        (source_include, source_declaration, source_dequeue),
+        (source_include, declarations_with_ticks[0], legacy_dequeue),
+        (source_include, declarations_with_ticks[1], legacy_dequeue),
+        (patched_include, source_declaration, patched_dequeue),
+    )
+    known_declarations = (source_declaration, *declarations_with_ticks)
+    known_dequeues = (source_dequeue, legacy_dequeue, patched_dequeue)
+    timeout_include = '#include "esp_video_dqbuf_timeout.h"'
+
+    include_state = (
+        source_text.count(source_include),
+        source_text.count(patched_include),
+        source_text.count(timeout_include),
+    )
+    if include_state == (1, 0, 0):
+        matched_include = source_include
+    elif include_state == (0, 1, 1):
+        matched_include = patched_include
+    else:
         raise RuntimeError("esp_video include context changed; update the override")
-    if legacy_patched_declaration in source_text:
-        source_text = source_text.replace(
-            legacy_patched_declaration,
-            source_declaration,
-            1,
+
+    declaration_count = sum(
+        source_text.count(declaration) for declaration in known_declarations
+    )
+    if declaration_count == 0:
+        raise RuntimeError(
+            "esp_video dequeue declaration changed; update the override"
         )
-    elif source_declaration not in source_text:
-        raise RuntimeError("esp_video dequeue declaration changed; update the override")
-    if source_dequeue in source_text:
-        source_text = source_text.replace(source_dequeue, patched_dequeue, 1)
-    elif legacy_patched_dequeue in source_text:
-        source_text = source_text.replace(
-            legacy_patched_dequeue,
-            patched_dequeue,
-            1,
-        )
-    elif patched_dequeue not in source_text:
+    if declaration_count != 1:
+        raise RuntimeError("esp_video dequeue source shape changed; update the override")
+
+    matched_declaration = next(
+        declaration
+        for declaration in known_declarations
+        if declaration in source_text
+    )
+    function_start = source_text.index(matched_declaration)
+    brace_start = source_text.index("{", function_start)
+    brace_depth = 0
+    function_end = None
+    for position in range(brace_start, len(source_text)):
+        if source_text[position] == "{":
+            brace_depth += 1
+        elif source_text[position] == "}":
+            brace_depth -= 1
+            if brace_depth == 0:
+                function_end = position + 1
+                break
+    if function_end is None:
         raise RuntimeError("esp_video dequeue context changed; update the override")
+
+    if source_text.count("esp_video_recv_element(") != 1:
+        raise RuntimeError("esp_video dequeue source shape changed; update the override")
+
+    function_text = source_text[function_start:function_end]
+    if function_text.count("esp_video_recv_element(") != 1:
+        raise RuntimeError("esp_video dequeue source shape changed; update the override")
+    if not any(dequeue in function_text for dequeue in known_dequeues):
+        raise RuntimeError("esp_video dequeue context changed; update the override")
+
+    for include, declaration, dequeue in source_shapes:
+        if (
+            matched_include == include
+            and function_text.startswith(declaration)
+            and dequeue in function_text
+        ):
+            function_text = function_text.replace(
+                declaration,
+                source_declaration,
+                1,
+            ).replace(dequeue, patched_dequeue, 1)
+            break
+    else:
+        raise RuntimeError("esp_video dequeue source shape changed; update the override")
+
+    source_text = (
+        source_text[:function_start]
+        + function_text
+        + source_text[function_end:]
+    )
+    if matched_include == source_include:
+        source_text = source_text.replace(source_include, patched_include, 1)
+
+    return source_text
+
+
+def apply_esp_video_dqbuf_timeout() -> None:
+    """Apply the tracked StackChan dequeue bound to esp_video 1.3.1."""
+    component_dir = Path("managed_components/espressif__esp_video")
+    manifest = component_dir / "idf_component.yml"
+    source = component_dir / "src/esp_video_ioctl.c"
+    cmake = component_dir / "CMakeLists.txt"
+    if not manifest.exists() or "version: 1.3.1" not in manifest.read_text(
+        encoding="utf-8"
+    ):
+        raise RuntimeError("esp_video 1.3.1 is required for the dequeue override")
+
+    source_text = _patch_esp_video_dqbuf_source(
+        source.read_text(encoding="utf-8")
+    )
     source.write_text(source_text, encoding="utf-8")
 
     cmake_text = cmake.read_text(encoding="utf-8")
