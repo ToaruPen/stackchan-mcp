@@ -480,6 +480,12 @@ async def test_esp32_hello_handshake(manager):
             auto_msg,
             result={"content": [{"type": "text", "text": "true"}], "isError": False},
         )
+        blink_msg = await _expect_auto_blink(ws)
+        await _send_mcp_response(
+            ws,
+            blink_msg,
+            result={"content": [{"type": "text", "text": "true"}], "isError": False},
+        )
 
         # Wait for manager to process
         await asyncio.sleep(0.2)
@@ -825,16 +831,22 @@ class _InitDeviceConnection:
         self,
         *,
         avatar_render_sent: bool = False,
+        blink_control_sent: bool = False,
         discover_ok: bool = True,
         auto_error: dict | None = None,
         auto_exception: Exception | None = None,
+        blink_error: dict | None = None,
+        blink_exception: Exception | None = None,
     ) -> None:
         self.tools: list[dict] = []
         self.tools_discovered = False
         self.avatar_render_sent = avatar_render_sent
+        self.blink_control_sent = blink_control_sent
         self.discover_ok = discover_ok
         self.auto_error = auto_error
         self.auto_exception = auto_exception
+        self.blink_error = blink_error
+        self.blink_exception = blink_exception
         self.initialize_calls = 0
         self.discover_calls = 0
         self.call_tool_calls: list[tuple[str, dict]] = []
@@ -855,7 +867,12 @@ class _InitDeviceConnection:
                 "name": "self.display.set_avatar",
                 "description": "Set avatar",
                 "inputSchema": {"type": "object"},
-            }
+            },
+            {
+                "name": "self.display.set_blink",
+                "description": "Set blink",
+                "inputSchema": {"type": "object"},
+            },
         ]
         self.tools_discovered = True
         return self.tools
@@ -864,9 +881,17 @@ class _InitDeviceConnection:
         self.call_tool_calls.append((name, arguments))
         if name == "self.display.set_avatar":
             self.avatar_render_sent = True
-        if self.auto_exception is not None:
-            raise self.auto_exception
-        return {"content": [{"type": "text", "text": "true"}]}, self.auto_error
+            if self.auto_exception is not None:
+                raise self.auto_exception
+            error = self.auto_error
+        elif name == "self.display.set_blink":
+            self.blink_control_sent = True
+            if self.blink_exception is not None:
+                raise self.blink_exception
+            error = self.blink_error
+        else:
+            error = None
+        return {"content": [{"type": "text", "text": "true"}]}, error
 
 
 class _AutoMcpWebSocket:
@@ -896,7 +921,12 @@ class _AutoMcpWebSocket:
                         "name": "self.display.set_avatar",
                         "description": "Set avatar",
                         "inputSchema": {"type": "object"},
-                    }
+                    },
+                    {
+                        "name": "self.display.set_blink",
+                        "description": "Set blink",
+                        "inputSchema": {"type": "object"},
+                    },
                 ],
                 "nextCursor": "",
             }
@@ -914,8 +944,22 @@ class _AutoMcpWebSocket:
 
 
 @pytest.mark.asyncio
-async def test_init_auto_renders_idle_avatar_after_tools_list():
-    """A successful initialize + tools/list sends idle set_avatar once."""
+async def test_call_tool_tracks_explicit_blink_control():
+    """Either set_blink value records connection-scoped user intent."""
+    ws = _AutoMcpWebSocket()
+    connection = ESP32Connection(ws, session_id="session-blink")  # type: ignore[arg-type]
+    ws.connection = connection
+
+    assert connection.blink_control_sent is False
+
+    await connection.call_tool("self.display.set_blink", {"enabled": False})
+
+    assert connection.blink_control_sent is True
+
+
+@pytest.mark.asyncio
+async def test_init_auto_renders_idle_avatar_and_enables_blink_after_tools_list():
+    """A successful initialize + tools/list sends idle then enables blink."""
     ws = _AutoMcpWebSocket()
     connection = ESP32Connection(ws, session_id="session-auto")  # type: ignore[arg-type]
     connection.device_id = "device-test"
@@ -937,14 +981,18 @@ async def test_init_auto_renders_idle_avatar_after_tools_list():
 
     await mgr._init_device(connection, "device-test")
 
-    assert ws.tool_calls == [("self.display.set_avatar", {"face": "idle"})]
+    assert ws.tool_calls == [
+        ("self.display.set_avatar", {"face": "idle"}),
+        ("self.display.set_blink", {"enabled": True}),
+    ]
     assert connection.avatar_render_sent is True
+    assert connection.blink_control_sent is True
     assert ready_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_init_skips_auto_idle_avatar_when_avatar_already_sent():
-    """The connection-scoped flag suppresses the automatic idle render."""
+    """An explicit face suppresses auto-idle without suppressing auto-blink."""
     mgr = ESP32Manager()
     connection = _InitDeviceConnection(avatar_render_sent=True)
 
@@ -952,7 +1000,22 @@ async def test_init_skips_auto_idle_avatar_when_avatar_already_sent():
 
     assert connection.initialize_calls == 1
     assert connection.discover_calls == 1
-    assert connection.call_tool_calls == []
+    assert connection.call_tool_calls == [
+        ("self.display.set_blink", {"enabled": True})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_init_skips_auto_blink_when_blink_control_already_sent():
+    """An explicit set_blink value is not overwritten during initialization."""
+    mgr = ESP32Manager()
+    connection = _InitDeviceConnection(blink_control_sent=True)
+
+    await mgr._init_device(connection, "device-test")  # type: ignore[arg-type]
+
+    assert connection.call_tool_calls == [
+        ("self.display.set_avatar", {"face": "idle"})
+    ]
 
 
 @pytest.mark.asyncio
@@ -988,15 +1051,41 @@ async def test_init_continues_when_auto_idle_avatar_fails(failure_mode, caplog):
     await mgr._init_device(connection, "device-test")  # type: ignore[arg-type]
 
     assert connection.call_tool_calls == [
-        ("self.display.set_avatar", {"face": "idle"})
+        ("self.display.set_avatar", {"face": "idle"}),
+        ("self.display.set_blink", {"enabled": True}),
     ]
     assert "auto-rendering idle avatar failed" in caplog.text
-    assert "ESP32 ready: device=device-test tools=1" in caplog.text
+    assert "ESP32 ready: device=device-test tools=2" in caplog.text
+
+
+@pytest.mark.parametrize("failure_mode", ["error", "timeout"])
+@pytest.mark.asyncio
+async def test_init_continues_when_auto_blink_fails(failure_mode, caplog):
+    """Auto-blink failures are warnings and do not block ESP32 ready."""
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.esp32_client")
+    if failure_mode == "error":
+        connection = _InitDeviceConnection(
+            blink_error={"code": -32000, "message": "device rejected set_blink"}
+        )
+    else:
+        connection = _InitDeviceConnection(
+            blink_exception=asyncio.TimeoutError("set_blink timed out")
+        )
+    mgr = ESP32Manager()
+
+    await mgr._init_device(connection, "device-test")  # type: ignore[arg-type]
+
+    assert connection.call_tool_calls == [
+        ("self.display.set_avatar", {"face": "idle"}),
+        ("self.display.set_blink", {"enabled": True}),
+    ]
+    assert "auto-enabling avatar blink failed" in caplog.text
+    assert "ESP32 ready: device=device-test tools=2" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_reconnect_auto_renders_idle_avatar_again():
-    """A new ESP32Connection gets a fresh auto-render flag."""
+async def test_reconnect_auto_renders_idle_avatar_and_enables_blink_again():
+    """A new ESP32Connection gets fresh avatar and blink flags."""
     first_ws = _AutoMcpWebSocket()
     first = ESP32Connection(first_ws, session_id="session-first")  # type: ignore[arg-type]
     first_ws.connection = first
@@ -1008,8 +1097,12 @@ async def test_reconnect_auto_renders_idle_avatar_again():
     await mgr._init_device(first, "device-test")
     await mgr._init_device(second, "device-test")
 
-    assert first_ws.tool_calls == [("self.display.set_avatar", {"face": "idle"})]
-    assert second_ws.tool_calls == [("self.display.set_avatar", {"face": "idle"})]
+    expected_calls = [
+        ("self.display.set_avatar", {"face": "idle"}),
+        ("self.display.set_blink", {"enabled": True}),
+    ]
+    assert first_ws.tool_calls == expected_calls
+    assert second_ws.tool_calls == expected_calls
 
 
 @pytest.mark.asyncio
@@ -2420,6 +2513,12 @@ async def _complete_handshake(ws, tools=None, *, consume_auto_avatar=True):
         auto_msg,
         result={"content": [{"type": "text", "text": "true"}], "isError": False},
     )
+    blink_msg = await _expect_auto_blink(ws)
+    await _send_mcp_response(
+        ws,
+        blink_msg,
+        result={"content": [{"type": "text", "text": "true"}], "isError": False},
+    )
     return auto_msg
 
 
@@ -2431,6 +2530,17 @@ async def _expect_auto_idle_avatar(ws):
     assert auto_msg["payload"]["method"] == "tools/call"
     assert auto_msg["payload"]["params"]["name"] == "self.display.set_avatar"
     assert auto_msg["payload"]["params"]["arguments"] == {"face": "idle"}
+    return auto_msg
+
+
+async def _expect_auto_blink(ws):
+    """Receive and assert the automatic avatar blink tools/call."""
+    auto_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+    auto_msg = json.loads(auto_raw)
+    assert auto_msg["type"] == "mcp"
+    assert auto_msg["payload"]["method"] == "tools/call"
+    assert auto_msg["payload"]["params"]["name"] == "self.display.set_blink"
+    assert auto_msg["payload"]["params"]["arguments"] == {"enabled": True}
     return auto_msg
 
 

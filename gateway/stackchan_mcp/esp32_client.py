@@ -77,6 +77,7 @@ def _is_loopback_bind_host(host: str) -> bool:
         return False
 
 _SET_AVATAR_TOOL = "self.display.set_avatar"
+_SET_BLINK_TOOL = "self.display.set_blink"
 
 _TOOL_LANES = {
     "self.robot.": "servo",
@@ -174,6 +175,7 @@ class ESP32Connection:
         self._initialized = False
         self._tools_discovered = False
         self._avatar_render_sent = False
+        self._blink_control_sent = False
         # Phase 4.5 avatar: pending load_avatar_set calls waiting for the
         # device's `avatar_set_loaded` reply. Keyed by expected checksum
         # so that overlapping fetches (different sets) can be discriminated.
@@ -202,6 +204,10 @@ class ESP32Connection:
     @property
     def avatar_render_sent(self) -> bool:
         return self._avatar_render_sent
+
+    @property
+    def blink_control_sent(self) -> bool:
+        return self._blink_control_sent
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -295,6 +301,8 @@ class ESP32Connection:
         """Call a tool on ESP32."""
         if name == _SET_AVATAR_TOOL:
             self._avatar_render_sent = True
+        if name == _SET_BLINK_TOOL:
+            self._blink_control_sent = True
         return await self.send_mcp_request(
             "tools/call", {"name": name, "arguments": arguments}
         )
@@ -1440,6 +1448,7 @@ class ESP32Manager:
                 logger.error("ESP32 tools discovery failed")
                 return
             await self._auto_render_idle_avatar(connection, device_id)
+            await self._auto_enable_blink(connection, device_id)
             await self._ensure_camera_stream_ready(connection)
             logger.info(
                 "ESP32 ready: device=%s tools=%d",
@@ -1476,6 +1485,34 @@ class ESP32Manager:
         if error:
             logger.warning(
                 "auto-rendering idle avatar failed: device=%s error=%s",
+                device_id,
+                error,
+            )
+
+    async def _auto_enable_blink(
+        self, connection: ESP32Connection, device_id: str
+    ) -> None:
+        """Best-effort blink enable after a fresh device session init."""
+        if connection.blink_control_sent:
+            return
+
+        logger.info("auto-enabling avatar blink: device=%s", device_id)
+        try:
+            _result, error = await connection.call_tool(
+                _SET_BLINK_TOOL,
+                {"enabled": True},
+            )
+        except Exception as exc:
+            logger.warning(
+                "auto-enabling avatar blink failed: device=%s error=%s",
+                device_id,
+                exc,
+            )
+            return
+
+        if error:
+            logger.warning(
+                "auto-enabling avatar blink failed: device=%s error=%s",
                 device_id,
                 error,
             )
