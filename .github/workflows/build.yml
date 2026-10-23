@@ -8,6 +8,8 @@ on:
     branches:
       - main
 
+  workflow_dispatch:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -17,7 +19,7 @@ jobs:
     name: Secretlint
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
     env:
       HUSKY: 0
 
@@ -41,7 +43,7 @@ jobs:
 
   firmware-build:
     name: Firmware build
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     steps:
       - name: Checkout repository
@@ -51,9 +53,14 @@ jobs:
 
       - name: Build firmware with ESP-IDF Docker image
         working-directory: firmware
+        env:
+          IDF_CONTAINER: stackchan-idf-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          trap 'docker rm -f "$IDF_CONTAINER" >/dev/null 2>&1 || true' EXIT
+          docker run --rm --name "$IDF_CONTAINER" \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --ulimit nofile=65536:65536 \
             -v "$PWD":/project \
             -w /project \
             espressif/idf:v5.5.2 \
@@ -78,7 +85,9 @@ jobs:
 
   firmware-host-test:
     name: Firmware host test
-    runs-on: ubuntu-latest
+    env:
+      HOST_TEST_BUILD_NAME: firmware-host-test-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     steps:
       - name: Checkout repository
@@ -88,26 +97,30 @@ jobs:
           submodules: recursive
 
       - name: Configure firmware host tests
-        run: cmake -S firmware/host_test -B /tmp/firmware-host-test-build
+        run: cmake -S firmware/host_test -B "$RUNNER_TEMP/$HOST_TEST_BUILD_NAME"
 
       - name: Build firmware host tests
-        run: cmake --build /tmp/firmware-host-test-build
+        run: cmake --build "$RUNNER_TEMP/$HOST_TEST_BUILD_NAME"
 
       - name: Run firmware host tests
-        run: ctest --test-dir /tmp/firmware-host-test-build --output-on-failure
+        run: ctest --test-dir "$RUNNER_TEMP/$HOST_TEST_BUILD_NAME" --output-on-failure
 
   gateway-test:
     name: Gateway test
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install libopus
+      - name: Install libopus on GitHub-hosted runners
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libopus0 libopus-dev
+
+      - name: Verify libopus is available
+        run: python3 -c "import ctypes; from ctypes.util import find_library; name = find_library('opus'); assert name, 'Install libopus0 and libopus-dev on the runner'; ctypes.CDLL(name)"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v3
@@ -129,7 +142,7 @@ jobs:
 
   gateway-windows-smoke:
     name: Gateway windows-smoke
-    runs-on: windows-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Windows", "X64", "stackchan-ci"]' || '["windows-latest"]') }}
     # Catch regressions in the Windows-only DLL bundling path
     # (`stackchan_mcp/__init__.py` arch gate + `add_dll_directory` +
     # PATH update, `pyproject.toml` artifacts list) at PR time rather

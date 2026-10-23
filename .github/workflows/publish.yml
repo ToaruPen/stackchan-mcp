@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build:
     name: Build, lint, and test
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     permissions:
       contents: read
@@ -49,6 +49,11 @@ jobs:
             exit 1
           fi
           echo "Tag commit verified to be on origin/main."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Set up uv
         # `astral-sh/setup-uv` ships immutable releases starting with
@@ -198,7 +203,7 @@ jobs:
     # will install onto. The job is gated on the Ubuntu build passing
     # so lint / pytest failures stop the pipeline before this much
     # slower runner spins up.
-    runs-on: windows-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Windows", "X64", "stackchan-ci"]' || '["windows-latest"]') }}
 
     permissions:
       contents: read
@@ -368,7 +373,7 @@ jobs:
     # explicit and survives future trigger additions (e.g. push to
     # branches).
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     # Trusted Publishing — short-lived OIDC token, no API secret needed.
     # The `pypi` environment must be configured on GitHub (Settings ->
@@ -382,6 +387,9 @@ jobs:
       id-token: write
 
     steps:
+      - name: Clear distributions from previous runs
+        run: rm -rf -- "$GITHUB_WORKSPACE/dist"
+
       - name: Download Linux distributions (sdist + py3-none-any wheel)
         uses: actions/download-artifact@v4
         with:

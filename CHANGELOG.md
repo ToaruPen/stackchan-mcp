@@ -68,6 +68,9 @@ documented-only.
 
 ### Tools
 
+- Add opt-in WinPC CI runners for trusted push and manual runs, using WSL
+  for Linux jobs and native Windows for Opus checks and wheels. Keep PR
+  checks on GitHub-hosted runners and document setup and rollback.
 - `firmware/scripts/Image_Converter`: Pillow 11.3.0 -> 13.0.0 (security
   advisories). The converter already uses `Image.Resampling.LANCZOS`.
 

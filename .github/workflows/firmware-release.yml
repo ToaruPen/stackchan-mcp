@@ -25,7 +25,7 @@ concurrency:
 jobs:
   build:
     name: Build firmware
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     permissions:
       contents: read
@@ -112,9 +112,14 @@ jobs:
         # tag-driven release artifact is byte-identical to what the PR
         # checks already validate.
         working-directory: firmware
+        env:
+          IDF_CONTAINER: stackchan-idf-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          trap 'docker rm -f "$IDF_CONTAINER" >/dev/null 2>&1 || true' EXIT
+          docker run --rm --name "$IDF_CONTAINER" \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --ulimit nofile=65536:65536 \
             -v "$PWD":/project \
             -w /project \
             espressif/idf:v5.5.2 \
@@ -155,12 +160,15 @@ jobs:
     # `startsWith(...)` guard makes the intent explicit and survives
     # future trigger additions.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/firmware-v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'ToaruPen/stackchan-mcp' && vars.STACKCHAN_SELF_HOSTED_CI == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["self-hosted", "Linux", "X64", "stackchan-ci"]' || '["ubuntu-latest"]') }}
 
     permissions:
       contents: write
 
     steps:
+      - name: Clear artifacts from previous runs
+        run: rm -rf -- "$GITHUB_WORKSPACE/dist"
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
