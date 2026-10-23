@@ -289,7 +289,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v8.1.0
         with:
-          enable-cache: true
+          enable-cache: ${{ runner.environment == 'github-hosted' }}
+          cache-local-path: ${{ runner.environment == 'self-hosted' && format('{0}/uv-cache', runner.tool_cache) || '' }}
 
       # `--extra tts` pulls in `opuslib`, which the smoke test below
       # imports. Without it, the smoke step fails with

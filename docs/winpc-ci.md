@@ -71,6 +71,8 @@ WSLでは`actions.runner.ToaruPen-stackchan-mcp.stackchan-toarupen-wsl.service`�
 
 Windows側の起動スクリプトは`%LOCALAPPDATA%\stackchan-ci\start-runner.ps1`、ログは同じフォルダの`runner.log`です。スタートアップ登録は`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`の`StackchanCIRunner`です。Windows側はログインが必要です。既存の別プロジェクト用runnerサービスは変更していません。
 
+Windowsの依存キャッシュはrunnerのツール用ディレクトリ内の`uv-cache`に保持します。self-hostedのWindowsジョブではGitHubへのキャッシュ転送を行わず、ローカルのキャッシュを再利用します。GitHub-hostedのキャッシュ動作は維持します。
+
 Windows runnerは普段のログインユーザーの権限で動きます。WSLの専用ユーザーもDockerへのアクセス権を持つため、いずれも未信頼コードの隔離環境ではありません。fork workflowの承認時には実行する変更を確認してください。
 
 PCのスリープ設定は変更していません。CI実行中はPCを起動・接続した状態にしてください。WSLの再起動で処理中のジョブが失われた場合は、そのGitHub Actions実行をキャンセルして新しく実行します。
