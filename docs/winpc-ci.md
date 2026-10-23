@@ -44,6 +44,8 @@ PyPI公開にはLinuxとDockerが必要です。Windows runnerだけでは`pypa/
 
 公開リポジトリでは、外部のコードがrunnerで実行され得る点を確認してから有効にしてください。このworkflowの通常のPR実行先はGitHub-hostedですが、PRでworkflow自体を書き換えられるため、イベント条件だけで個人PCを隔離できるわけではありません。GitHub側のfork workflow承認設定を確認し、workflow変更を含む未信頼の実行を承認しない運用と、個人データや常駐サービスからのrunnerの分離が必要です。
 
+このリポジトリでは、fork workflowの承認対象をすべての外部コントリビューターに設定します。初回の投稿者だけを対象にする設定では、過去に投稿した外部ユーザーのworkflowが自動実行され得ます。
+
 1. 変更を含むworkflowをGitHubへ反映し、両方のrunnerがOnlineになっていることを確認します。
 2. **Settings > Secrets and variables > Actions > Variables** で、リポジトリ変数`STACKCHAN_SELF_HOSTED_CI`を`true`に設定します。環境変数やsecretではなく、リポジトリ変数を使います。
 3. **Actions > Build > Run workflow** を実行します。各ジョブのrunner名を開き、LinuxジョブはWSL、Windows smokeはWindows側に割り当てられたことを確認します。Secretlint、ファームウェアのビルドと成果物検査、host test、Gatewayのruffとpytest、WindowsのOpus検証がすべて成功することを確認します。
@@ -53,6 +55,25 @@ PyPI公開にはLinuxとDockerが必要です。Windows runnerだけでは`pypa/
 変数が`true`で、リポジトリが`ToaruPen/stackchan-mcp`かつイベントが`push`または`workflow_dispatch`の場合だけ、WinPCを選びます。他のリポジトリや通常のPRではGitHub-hostedを使います。タグの検証、公開条件、権限は変更していません。
 
 変数を有効にした後でWinPCが停止すると、ジョブはrunner待ちになります。GitHub-hostedへの自動切り替えはありません。
+
+## ToaruPenでの配置と起動
+
+2026年10月23日の導入先は次のとおりです。
+
+| 項目 | WSL | Windows |
+|---|---|---|
+| runner名 | `stackchan-toarupen-wsl` | `stackchan-toarupen-windows` |
+| 配置先 | `/opt/stackchan-ci/runner` | `%LOCALAPPDATA%\stackchan-ci\runner` |
+| 実行ユーザー | 専用の`stackchan-ci` | Windowsのログインユーザー |
+| 起動方式 | systemdサービス | ログイン時の`StackchanCIRunner`スタートアップ |
+
+WSLでは`actions.runner.ToaruPen-stackchan-mcp.stackchan-toarupen-wsl.service`を有効にしています。Ubuntu起動時にDockerとrunnerが起動します。Windows側の既存の`WSL-Ubuntu-RemoteAccess`タスクは変更していません。
+
+Windows側の起動スクリプトは`%LOCALAPPDATA%\stackchan-ci\start-runner.ps1`、ログは同じフォルダの`runner.log`です。スタートアップ登録は`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`の`StackchanCIRunner`です。Windows側はログインが必要です。既存の別プロジェクト用runnerサービスは変更していません。
+
+Windows runnerは普段のログインユーザーの権限で動きます。WSLの専用ユーザーもDockerへのアクセス権を持つため、いずれも未信頼コードの隔離環境ではありません。fork workflowの承認時には実行する変更を確認してください。
+
+PCのスリープ設定は変更していません。CI実行中はPCを起動・接続した状態にしてください。WSLの再起動で処理中のジョブが失われた場合は、そのGitHub Actions実行をキャンセルして新しく実行します。
 
 ## GitHub-hostedに戻す
 
