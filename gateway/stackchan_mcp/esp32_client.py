@@ -15,7 +15,7 @@ import os
 import secrets
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 import websockets
 import websockets.exceptions
@@ -197,6 +197,7 @@ class ESP32Connection:
         self._tools_discovered = False
         self._avatar_render_sent = False
         self._blink_control_sent = False
+        self._audio_capture_generation = 0
         # Phase 4.5 avatar: pending load_avatar_set calls waiting for the
         # device's `avatar_set_loaded` reply. Keyed by expected checksum
         # so that overlapping fetches (different sets) can be discriminated.
@@ -530,10 +531,24 @@ class ESP32Connection:
             "state": state,
         }
         if state == "start":
+            self._audio_capture_generation += 1
             message["mode"] = mode
             if profile != "voice":
                 message["profile"] = profile
         await self._ws_send(json.dumps(message))
+
+    async def send_avatar_activity(self, state: Literal["thinking", "idle"]) -> None:
+        """Best-effort processing feedback; older firmware can ignore it."""
+        if not self._connected:
+            return
+        try:
+            await self._ws_send(json.dumps({
+                "session_id": self.session_id,
+                "type": "avatar_activity",
+                "state": state,
+            }))
+        except Exception as exc:
+            logger.debug("avatar activity notification failed: %s", exc)
 
     def disconnect(self) -> None:
         """Mark connection as disconnected."""
@@ -1391,6 +1406,7 @@ class ESP32Manager:
                     # forwarding pipeline.
                     state = data.get("state", "")
                     if state == "start":
+                        connection._audio_capture_generation += 1
                         if not self._audio_hook_url:
                             logger.debug(
                                 "device-driven listen.start session=%s "
@@ -1430,11 +1446,9 @@ class ESP32Manager:
                             # failures are logged inside
                             # push_audio_capture and do not propagate.
                             asyncio.create_task(
-                                push_audio_capture(
-                                    self._audio_hook_url,
-                                    self._audio_hook_token,
-                                    frames,
-                                    session_id=session_id,
+                                self._push_audio_capture_with_activity(
+                                    connection, frames,
+                                    connection._audio_capture_generation,
                                 )
                             )
                     else:
@@ -2091,6 +2105,37 @@ class ESP32Manager:
         return await conn.send_avatar_set_fetch(
             url, token, mode, checksum, expected_size, timeout
         )
+
+    async def _push_audio_capture_with_activity(
+        self, connection: ESP32Connection, frames: Sequence[bytes], generation: int
+    ) -> None:
+        if not frames:
+            return
+
+        def owns_activity() -> bool:
+            return (
+                self.connection_for(connection.device_id) is connection
+                and connection._audio_capture_generation == generation
+            )
+
+        try:
+            if owns_activity():
+                await connection.send_avatar_activity("thinking")
+            await push_audio_capture(
+                self._audio_hook_url, self._audio_hook_token, frames,
+                session_id=connection.session_id,
+            )
+        finally:
+            if owns_activity():
+                await connection.send_avatar_activity("idle")
+
+    async def send_avatar_activity(
+        self, state: Literal["thinking", "idle"], device_id: str | None = None
+    ) -> None:
+        """Notify only the requested device; feedback never requires a reply."""
+        connection = self.connection_for(device_id)
+        if connection is not None:
+            await connection.send_avatar_activity(state)
 
     async def send_audio_frame(
         self, opus_frame: bytes, device_id: str | None = None

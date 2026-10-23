@@ -734,8 +734,8 @@ gateway がデバイスに `{"type":"listen","state":"start","mode":"manual"}`
 STT エンジンに渡して文字起こし、という流れです。`faster-whisper`
 エンジンの初回呼び出しではモデル（`base` で約 140 MB）が Hugging
 Face キャッシュにダウンロードされ、以降は再利用されます。
-見た目でキャプチャ中であることを示したい場合は、`motion="face-only"`
-でキャプチャ中に `thinking` アバターを表示して終了時に `idle` へ戻すか、
+標準アバターは聞き取り・文字起こしの状態を自動表示します。
+録音前に表情で合図する場合は `motion="face-only"`、
 `motion="look-up"` で yaw を保ったまま pitch を `look_up_pitch`
 （デフォルト 50°、有効範囲 5..85°）へ傾け、`thinking` を表示し、
 成功時はその姿勢を保持できます。STT フレームワークもエンジン非依存なので、
@@ -987,40 +987,51 @@ messages:
 がそれを key にしている場合は安定させておいてください。詳細な注釈
 付きリファレンスは `notify.example.yml` を参照してください。
 
-## アバター画像について
+## アバター
 
-`firmware/main/boards/stackchan/avatar_images.cc` は **真っ黒 RGB565 のプレースホルダ** です。ビルドは通りますが、画面には何も表示されません。
+標準の顔は、M5Stack公式の
+[DefaultAvatar](https://github.com/m5stack/StackChan/tree/eff0d6b5109663faec8f1d98848b4b0e5246bbfc/firmware/main/stackchan/avatar/skins/default)
+を移植したLVGL描画です。PNG素材を生成せずに、通常動作へ移ると自動で表示します。
+公式の目・口の形状と寸法を使用し、MITライセンスの帰属を
+`firmware/main/boards/stackchan/official_avatar.LICENSE` に保存しています。
 
-個人用アバターを使う場合は、PNG 元画像を git の外に置き、git に無視されるローカル override ファイルを生成します。
+| 状態 | 表情 |
+|---|---|
+| 待機 | 普通の目と閉じた口。3〜6秒ごとに瞬き |
+| 聞き取り | 目を大きくして、少し上を見る |
+| 思考 | まぶたを少し下げ、斜め上を見る |
+| 発話 | 笑った目と、再生音声の強弱に合わせて動く口。発話中も瞬きする |
+
+gatewayが文字起こし中であることを通知します。空でない文字起こし結果を返した後も、
+呼び出し元が応答を準備する間は思考の表情を保ちます。発話・次の録音・失敗・
+キャンセル・30秒のタイムアウトで解除します。任意設定の音声フックは、HTTPリクエストの
+実行中だけ思考の表情を表示します。リップシンクは、スピーカーへ出力する直前のPCM音声を測定します。
+声の強弱で口の開き具合が変わり、無音では閉じ、割り込みで停止します。
+音量に連動する方式で、母音・子音を推定して口形を作る方式ではありません。
+
+`set_avatar("idle")` は現在の会話状態に合った表情へ戻します。他の表情指定は、
+次の状態変化まで優先します。タッチへの反応後も現在の会話状態に戻ります。
+`set_avatar("off")` は会話状態が変わっても維持し、別の表情を明示指定すると復帰します。
+WiFi設定・アクティベーション・firmware更新の画面は隠しません。
+`set_blink(false)` で自動の瞬きを停止できます。
+
+独自の画像セットは、引き続き `load_avatar_set` で明示的に読み込めます。
+標準ビルドでは `avatar_images.cc` と `avatar_images.local.cc` を組み込みません。
+既存の個人用ファイルは変更しません。画像セットを使う場合は
+[作成時の注意点](docs/avatar-authoring-notes.md)を参照してください。
+
+PC上で描画を検証するには、次を実行します。
 
 ```bash
-cd firmware
-python scripts/avatar_convert/convert_avatars.py
+cmake -S firmware/host_test/avatar_preview -B /tmp/stackchan-avatar-preview-build
+cmake --build /tmp/stackchan-avatar-preview-build -j 4
+ctest --test-dir /tmp/stackchan-avatar-preview-build --output-on-failure
+/tmp/stackchan-avatar-preview-build/avatar_preview /tmp/stackchan-avatar-frames
 ```
 
-既定では、変換スクリプトは `~/.stackchan/avatar/` から PNG を読み込み、以下を書き出します。
-
-- `firmware/main/boards/stackchan/avatar_images.local.cc`
-- `firmware/main/boards/stackchan/avatar_images.local.h`
-
-これらのローカルファイルは git に無視されます。`avatar_images.local.cc` が存在する場合、StackChan firmware のビルドでは追跡対象の黒いプレースホルダではなく、このローカルファイルが使われます。そのため、`git pull` で個人用アバターが上書きされません。
-
-追跡対象の `avatar_images.cc` / `avatar_images.h` は公開Repo用のプレースホルダです。メンテナが意図してこれらを更新する場合だけ `--tracked` を指定できますが、個人用アバターでは既定のローカル出力先を使ってください。
-
-すでに一度 firmware をビルドしたあとにローカルアバターを追加した場合は、CMake が新しい override を拾えるように `firmware/build/` を削除してから再ビルドしてください。
-
-シンボル一覧 (`avatar_images.h` 参照):
-- 表情系 (6): `avatar_idle`, `avatar_happy`, `avatar_thinking`, `avatar_sad`, `avatar_surprised`, `avatar_embarrassed`
-- 目 (3): `avatar_eyes_open`, `avatar_eyes_half`, `avatar_eyes_closed`
-- 口 (5): `avatar_mouth_closed`, `avatar_mouth_half`, `avatar_mouth_open`, `avatar_mouth_e`, `avatar_mouth_u`
-
-`~/.stackchan/avatar/` に置く PNG ファイル名:
-
-- 表情系: `idle.png`, `happy.png`, `thinking.png`, `sad.png`, `surprised.png`, `embarrassed.png`
-- 目: `eyes_open.png`, `eyes_half.png`, `eyes_closed.png`
-- 口: `mouth_closed.png`, `mouth_half.png`, `mouth_open.png`, `mouth_e.png`, `mouth_u.png`
-
-個人用 PNG、生成済みローカルアバター、撮影画像、その他ユーザー固有のアセットは commit しないでください。
+固定したLVGL 9.5.0をビルドし、描画ピクセルの検査とPPM画像の出力を行います。
+既存のLVGL 9.5.0ソースを使う場合は、CMakeに `-DLVGL_SOURCE_DIR=/absolute/path` を渡します。
+実機の画面更新と音声とのタイミングは、別途実機で確認してください。
 
 ## 既知の課題
 

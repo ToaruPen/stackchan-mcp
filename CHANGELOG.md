@@ -32,12 +32,21 @@ documented-only.
 
 ### Firmware
 
+- Replace the default image avatar with M5Stack's official procedural LVGL
+  face. Show idle, listening, thinking, and speaking expressions automatically;
+  compose blinking with mouth movement, preserve explicit off and system UI,
+  and retain optional runtime image sets. Drive mouth opening from decoded
+  playback PCM energy, with silence gating and interruption handling. Static local image files are no
+  longer compiled. Include a headless LVGL framebuffer verification tool.
 - Keep the automatic-sleep setting and external-power policy consistent:
   enabling automatic sleep on USB still requires the external-power
   auto-off opt-in before the shutdown timer runs.
 
 ### Gateway
 
+- Report avatar processing activity during STT and audio-hook forwarding;
+  clear it on errors, cancellation, and empty transcription without routing
+  feedback to a different device after a default-device change.
 - Preserve default-device camera and face-follow ownership when using the
   multi-device registry; stop active tracking before switching devices.
 

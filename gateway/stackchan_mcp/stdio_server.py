@@ -2369,7 +2369,8 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "actual visible expression, not just a label. "
                     "Pass 'off' to hide the avatar and disable blink, exposing the "
                     "underlying xiaozhi-esp32 screens (WiFi config UI, OTA, settings); "
-                    "any other face brings the avatar back and restores blink."
+                    "any other face brings the avatar back and restores blink. "
+                    "On the official avatar, idle resumes the current conversation expression."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2398,8 +2399,8 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 name="set_mouth",
                 description=(
                     "Set the avatar mouth shape for lip-sync. "
-                    "The shape is held until the next set_avatar / set_mouth call, "
-                    "or until an autonomous blink restores the resting face. "
+                    "The official avatar keeps blinking independently of mouth movement. "
+                    "Downloaded layered image sets may replace the mouth after a blink. "
                     "Calling this while a set_mouth_sequence is in flight "
                     "interrupts the sequence."
                 ),
@@ -2426,17 +2427,11 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "loop). Returns immediately with the queued step count "
                     "and estimated total duration. Calling set_mouth, "
                     "set_avatar, or this tool again interrupts the in-flight "
-                    "sequence and replaces it. Autonomous blink is paused "
-                    "while a sequence is playing and resumed when it ends. "
-                    "The final shape is held until the next "
-                    "set_mouth / set_avatar call, or until an autonomous "
-                    "blink restores the resting face — this is the same "
-                    "Phase 2 trade-off that applies to set_mouth, since the "
-                    "blink animation ends by repainting the full face. If "
-                    "the final shape must persist visually, disable blink "
-                    "with set_blink(false) before the sequence (or append a "
-                    "closed step if you just want the mouth to close at "
-                    "the end)."
+                    "sequence and replaces it. The official avatar blinks while "
+                    "the mouth moves; downloaded image sets pause blink during "
+                    "the sequence. The final mouth shape is held; append a "
+                    "closed step to close it. Sequences stop when the avatar "
+                    "is hidden or speech is interrupted."
                 ),
                 inputSchema={
                     "type": "object",

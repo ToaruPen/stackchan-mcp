@@ -36,6 +36,7 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+#define MAIN_EVENT_PLAYBACK_DRAIN       (1 << 13)
 
 
 enum AecMode {
@@ -157,6 +158,8 @@ private:
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    esp_timer_handle_t playback_drain_timer_ = nullptr;
+    std::atomic<bool> tts_stop_pending_{false};
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     std::atomic<ListeningProfile> pending_listening_profile_{kListeningProfileVoice};
@@ -181,6 +184,8 @@ private:
 
     // Event handlers
     void HandleStateChangedEvent();
+    void FinishTtsPlaybackIfDrained();
+    void CancelPendingTtsStop();
     void HandleToggleChatEvent();
     void HandleStartListeningEvent();
     void HandleStopListeningEvent();

@@ -825,8 +825,8 @@ capture window, then sends `{"type":"listen","state":"stop"}` and
 hands the buffered audio to the registered STT engine. The first call
 to the `faster-whisper` engine downloads the chosen model (~140 MB
 for `base`) into the Hugging Face cache; subsequent calls reuse it.
-For visible capture feedback, pass `motion="face-only"` to show the
-`thinking` avatar during capture and restore `idle` at the end, or
+The default avatar automatically shows listening and transcription activity.
+For an explicit face cue before recording, pass `motion="face-only"`, or
 `motion="look-up"` to preserve yaw, tilt pitch to `look_up_pitch`
 (default 50°, valid 5..85°), show `thinking`, and hold that pose on
 success. The STT framework is engine-agnostic — additional engines
@@ -1083,40 +1083,52 @@ The `action` value is forwarded in the event metadata, so keep it
 stable if a downstream consumer keys off it. See `notify.example.yml`
 for the full annotated reference.
 
-## About the avatar images
+## Avatar
 
-`firmware/main/boards/stackchan/avatar_images.cc` is a **pure black RGB565 placeholder**. The firmware builds and runs, but the screen will display nothing.
+StackChan now displays a procedural LVGL face adapted from M5Stack's official
+[DefaultAvatar](https://github.com/m5stack/StackChan/tree/eff0d6b5109663faec8f1d98848b4b0e5246bbfc/firmware/main/stackchan/avatar/skins/default).
+It appears automatically in normal operation without generated PNG assets.
+The port preserves the official eye and mouth geometry and MIT attribution in
+`firmware/main/boards/stackchan/official_avatar.LICENSE`.
 
-For a personal avatar, keep PNG sources outside git and generate ignored local override files:
+| Activity | Face |
+|---|---|
+| Idle | Neutral eyes and a closed mouth; blinks every 3–6 seconds |
+| Listening | Larger eyes looking slightly upward |
+| Thinking | Half-lidded eyes looking up and to the side |
+| Speaking | Happy eyes and a mouth that follows playback volume; blinking continues |
+
+The gateway reports thinking during transcription. A successful nonempty
+transcript keeps that face while the caller prepares a reply. Speech, a new
+recording, failure, cancellation, or a 30-second timeout ends it. The optional
+audio hook shows thinking only while its HTTP request runs. Lip sync measures the decoded PCM immediately before speaker output. The mouth
+opens with speech energy, closes during silence, and stops on interruption.
+This is amplitude-based lip sync; it does not infer phoneme-specific mouth shapes.
+
+`set_avatar("idle")` returns to the current activity's expression. Other
+expressions override it until the next activity change. Touch reactions return
+to the current activity. `set_avatar("off")` stays off through conversation
+changes; another explicit face restores it. WiFi setup, activation, and firmware
+update screens remain visible. `set_blink(false)` disables automatic blinking.
+
+`load_avatar_set` still selects a custom image set explicitly at runtime.
+The default build no longer compiles `avatar_images.cc` or
+`avatar_images.local.cc`. Existing personal files remain untouched. See
+[custom image-set notes](docs/avatar-authoring-notes.md) for that optional path.
+
+To verify the renderer on a computer, run:
 
 ```bash
-cd firmware
-python scripts/avatar_convert/convert_avatars.py
+cmake -S firmware/host_test/avatar_preview -B /tmp/stackchan-avatar-preview-build
+cmake --build /tmp/stackchan-avatar-preview-build -j 4
+ctest --test-dir /tmp/stackchan-avatar-preview-build --output-on-failure
+/tmp/stackchan-avatar-preview-build/avatar_preview /tmp/stackchan-avatar-frames
 ```
 
-By default, the converter reads PNGs from `~/.stackchan/avatar/` and writes:
-
-- `firmware/main/boards/stackchan/avatar_images.local.cc`
-- `firmware/main/boards/stackchan/avatar_images.local.h`
-
-These local files are ignored by git. When `avatar_images.local.cc` exists, the StackChan firmware build uses it instead of the tracked black placeholder, so `git pull` will not overwrite your personal avatar.
-
-The tracked `avatar_images.cc` / `avatar_images.h` files are public placeholder files. Maintainers who intentionally need to refresh those tracked files can pass `--tracked`, but personal avatars should use the default local output path.
-
-If you add a local avatar after you have already built the firmware once, remove `firmware/build/` and rebuild so CMake can pick up the new local override.
-
-Symbol list (see `avatar_images.h`):
-- Expressions (6): `avatar_idle`, `avatar_happy`, `avatar_thinking`, `avatar_sad`, `avatar_surprised`, `avatar_embarrassed`
-- Eyes (3): `avatar_eyes_open`, `avatar_eyes_half`, `avatar_eyes_closed`
-- Mouth (5): `avatar_mouth_closed`, `avatar_mouth_half`, `avatar_mouth_open`, `avatar_mouth_e`, `avatar_mouth_u`
-
-Expected PNG filenames under `~/.stackchan/avatar/`:
-
-- Expressions: `idle.png`, `happy.png`, `thinking.png`, `sad.png`, `surprised.png`, `embarrassed.png`
-- Eyes: `eyes_open.png`, `eyes_half.png`, `eyes_closed.png`
-- Mouth: `mouth_closed.png`, `mouth_half.png`, `mouth_open.png`, `mouth_e.png`, `mouth_u.png`
-
-Do not commit personal PNGs, generated local avatar files, photos, or other user-specific assets.
+This builds pinned LVGL 9.5.0, checks the rendered pixels, and exports PPM frames.
+To use an existing LVGL 9.5.0 source tree, pass `-DLVGL_SOURCE_DIR=/absolute/path`
+to CMake. Hardware verification is still required for panel timing and audio
+synchronization.
 
 ## Hardware safety notes
 

@@ -1105,7 +1105,13 @@ async def test_pipeline_sends_listen_stop_on_cancellation(fake_decode):
     orchestrator coroutine itself is being torn down.
     """
     engine = _CapturingEngine()
-    esp32 = _FakeESP32()  # no frame injection; the sleep will be cancelled
+    esp32 = _FakeESP32(frames_to_inject=[b"partial-audio"])
+    activity = []
+
+    async def send_activity(state):
+        activity.append(state)
+
+    esp32.connection.send_avatar_activity = send_activity
     gateway = _FakeGateway(esp32)
 
     reg = EngineRegistry()
@@ -1138,6 +1144,7 @@ async def test_pipeline_sends_listen_stop_on_cancellation(fake_decode):
     # Engine is not invoked because the cancellation prevents the
     # post-capture transcribe step.
     assert engine.calls == []
+    assert activity == []  # Cancellation cleanup is not a processing request.
 
 
 @pytest.mark.asyncio
@@ -1200,3 +1207,169 @@ def test_resolve_listen_language_uses_env_when_omitted(monkeypatch):
 def test_resolve_listen_language_argument_wins(monkeypatch):
     monkeypatch.setenv("STACKCHAN_LISTEN_LANGUAGE", "en")
     assert orchestrator.resolve_listen_language({"language": "ja"}) == "ja"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,expected", [("はい", ["thinking"]), ("  ", ["thinking", "idle"])])
+async def test_processing_avatar_follows_stop_and_precedes_decode(
+    text, expected, fake_decode, fast_sleep, monkeypatch
+):
+    esp32 = _FakeESP32(frames_to_inject=[b"audio"])
+    activity = []
+
+    async def send_activity(state):
+        assert esp32.listen_states[-1][0] == "stop"
+        activity.append(state)
+
+    esp32.connection.send_avatar_activity = send_activity
+
+    def decode(frames):
+        assert activity == ["thinking"]
+        return b"pcm"
+
+    monkeypatch.setattr(orchestrator, "decode_opus_frames", decode)
+    reg = EngineRegistry()
+    reg.register(_CapturingEngine(text=text))
+    await listen_and_transcribe(
+        {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+    )
+    assert activity == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("failed"), asyncio.CancelledError()])
+async def test_processing_avatar_clears_on_stt_failure(failure, fake_decode, fast_sleep):
+    esp32 = _FakeESP32(frames_to_inject=[b"audio"])
+    activity = []
+
+    async def send_activity(state):
+        activity.append(state)
+
+    esp32.connection.send_avatar_activity = send_activity
+    reg = EngineRegistry()
+    reg.register(_RaisingEngine(failure))
+    with pytest.raises(type(failure)):
+        await listen_and_transcribe(
+            {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+        )
+    assert activity == ["thinking", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_processing_avatar_failure_does_not_fail_transcription(fake_decode, fast_sleep):
+    esp32 = _FakeESP32(frames_to_inject=[b"audio"])
+
+    async def send_activity(state):
+        raise ConnectionError("feedback unavailable")
+
+    esp32.connection.send_avatar_activity = send_activity
+    reg = EngineRegistry()
+    reg.register(_CapturingEngine(text="はい"))
+    result = await listen_and_transcribe(
+        {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+    )
+    assert result["text"] == "はい"
+
+
+@pytest.mark.asyncio
+async def test_empty_capture_does_not_show_processing(fake_decode, fast_sleep):
+    esp32 = _FakeESP32()
+    activity = []
+
+    async def send_activity(state):
+        activity.append(state)
+
+    esp32.connection.send_avatar_activity = send_activity
+    reg = EngineRegistry()
+    reg.register(_CapturingEngine())
+    await listen_and_transcribe(
+        {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+    )
+    assert activity == []
+
+
+@pytest.mark.asyncio
+async def test_processing_feedback_stays_on_capture_connection_after_default_changes(
+    fake_decode, fast_sleep
+):
+    esp32 = _FakeESP32(frames_to_inject=[b"audio"])
+    original = esp32.connection
+    activity = []
+
+    async def send_activity(state):
+        activity.append(("original", state))
+
+    async def replacement_activity(state):
+        activity.append(("replacement", state))
+
+    original.send_avatar_activity = send_activity
+
+    class SwitchDefaultEngine(_CapturingEngine):
+        async def transcribe(self, pcm, **opts):
+            esp32.connection = SimpleNamespace(send_avatar_activity=replacement_activity)
+            return {"text": "", "language": "ja"}
+
+    reg = EngineRegistry()
+    reg.register(SwitchDefaultEngine())
+    await listen_and_transcribe(
+        {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+    )
+    assert activity == [("original", "thinking"), ("original", "idle")]
+
+
+@pytest.mark.asyncio
+async def test_processing_avatar_clears_on_decode_failure(fast_sleep, monkeypatch):
+    esp32 = _FakeESP32(frames_to_inject=[b"invalid-opus"])
+    activity = []
+
+    async def send_activity(state):
+        activity.append(state)
+
+    def broken_decode(frames):
+        raise ValueError("bad audio")
+
+    esp32.connection.send_avatar_activity = send_activity
+    monkeypatch.setattr(orchestrator, "decode_opus_frames", broken_decode)
+    reg = EngineRegistry()
+    reg.register(_CapturingEngine())
+    with pytest.raises(RuntimeError, match="Opus decode failed"):
+        await listen_and_transcribe(
+            {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+        )
+    assert activity == ["thinking", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError("old STT failed"), asyncio.CancelledError()])
+async def test_old_transcription_completion_does_not_clear_new_capture_activity(
+    failure, fake_decode, fast_sleep
+):
+    esp32 = _FakeESP32(frames_to_inject=[b"audio"])
+    esp32.connection._audio_capture_generation = 1
+    activity = []
+
+    async def send_activity(state):
+        activity.append(state)
+
+    esp32.connection.send_avatar_activity = send_activity
+
+    class NewCaptureEngine(_CapturingEngine):
+        async def transcribe(self, pcm, **opts):
+            assert not is_recording()
+            esp32.connection._audio_capture_generation += 1
+            await esp32.connection.send_avatar_activity("thinking")
+            if failure is not None:
+                raise failure
+            return {"text": "", "language": "ja"}
+
+    reg = EngineRegistry()
+    reg.register(NewCaptureEngine())
+    operation = listen_and_transcribe(
+        {"duration_ms": 100}, gateway=_FakeGateway(esp32), registry=reg
+    )
+    if failure is None:
+        await operation
+    else:
+        with pytest.raises(type(failure)):
+            await operation
+    assert activity == ["thinking", "thinking"]

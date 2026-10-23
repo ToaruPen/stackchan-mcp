@@ -136,6 +136,18 @@ def _validate_motion_args(
     return motion, look_up_pitch
 
 
+async def _send_avatar_activity(
+    connection: Any, state: Literal["thinking", "idle"]
+) -> None:
+    # Retain the capture's connection, not a default that can change during STT.
+    sender = getattr(connection, "send_avatar_activity", None)
+    if sender is not None:
+        try:
+            await sender(state)
+        except Exception as exc:
+            logger.debug("avatar activity notification failed: %s", exc)
+
+
 async def _call_tool_for_device(
     esp32: Any, name: str, arguments: dict[str, Any], device_id: str | None
 ) -> tuple[Any, dict[str, Any] | None]:
@@ -487,6 +499,8 @@ async def listen_and_transcribe(
     actual_duration_ms = 0
     motion_saved_angles: tuple[float, float] | None = None
     succeeded = False
+    processing_started = False
+    processing_generation = None
 
     async with lock_ctx, capture_lock():
         connection_for = getattr(gateway.esp32, "connection_for", None)
@@ -588,6 +602,10 @@ async def listen_and_transcribe(
                 frames = stop_recording()
 
             frame_count = len(frames)
+            processing_generation = getattr(connection, "_audio_capture_generation", None)
+            if frame_count:
+                processing_started = True
+                await _send_avatar_activity(connection, "thinking")
             if frame_count == 0:
                 # Distinguish "device disconnected with no frames" (likely
                 # protocol mismatch / firmware not yet supporting listen)
@@ -640,31 +658,40 @@ async def listen_and_transcribe(
             primary_exc = exc
             raise
         finally:
-            cleanup_error = await _shield_listen_motion_cleanup(
-                gateway,
-                motion,
-                motion_saved_angles,
-                succeeded=succeeded,
-                device_id=device_id,
-            )
-            if cleanup_error is not None:
-                if primary_exc is not None:
-                    # Listen body already failed AND rollback also
-                    # failed — chain via ``__cause__`` so the
-                    # caller sees both physical-state concerns. The
-                    # listen failure stays primary (it triggered the
-                    # rollback attempt); the rollback failure is
-                    # exposed via ``__cause__`` for inspection. Any
-                    # pre-existing ``__cause__`` on the listen
-                    # failure (e.g. engine's TimeoutError chained
-                    # to a RuntimeError) is preserved on
-                    # ``__context__`` automatically.
-                    raise primary_exc from cleanup_error
-                # Cleanup itself failed on an otherwise-successful
-                # listen — surface it so the failure doesn't vanish
-                # into a logger.warning while the device may be
-                # off-baseline.
-                raise cleanup_error
+            keep_thinking = False
+            try:
+                cleanup_error = await _shield_listen_motion_cleanup(
+                    gateway,
+                    motion,
+                    motion_saved_angles,
+                    succeeded=succeeded,
+                    device_id=device_id,
+                )
+                if cleanup_error is not None:
+                    if primary_exc is not None:
+                        # Listen body already failed AND rollback also
+                        # failed — chain via ``__cause__`` so the
+                        # caller sees both physical-state concerns. The
+                        # listen failure stays primary (it triggered the
+                        # rollback attempt); the rollback failure is
+                        # exposed via ``__cause__`` for inspection. Any
+                        # pre-existing ``__cause__`` on the listen
+                        # failure (e.g. engine's TimeoutError chained
+                        # to a RuntimeError) is preserved on
+                        # ``__context__`` automatically.
+                        raise primary_exc from cleanup_error
+                    # Cleanup itself failed on an otherwise-successful
+                    # listen — surface it so the failure doesn't vanish
+                    # into a logger.warning while the device may be
+                    # off-baseline.
+                    raise cleanup_error
+                keep_thinking = succeeded and bool((result.get("text", "") or "").strip())
+            finally:
+                if (
+                    processing_started and not keep_thinking
+                    and getattr(connection, "_audio_capture_generation", None) == processing_generation
+                ):
+                    await asyncio.shield(_send_avatar_activity(connection, "idle"))
 
     logger.info(
         "listen(): engine=%s frames=%d duration_ms=%d text=%r",

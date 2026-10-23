@@ -77,52 +77,45 @@ In `application.cc`, a touch during `kDeviceStateListening` calls `CloseAudioCha
 
 `OpenAudioChannel()` is only triggered by user interaction (touch, wake word). Boot does NOT auto-connect. PR #197 adds a boot-time WS auto-connect path.
 
-### LCD display initial state
+### Avatar rendering and conversation activity
 
-The avatar is **not shown at boot** — it only appears after a `set_avatar(<face>)` call. Default post-boot/reconnect state is a blank screen. This is tracked as Issue #77 (enhancement: auto-show idle avatar on connect).
+The default avatar is the procedural LVGL renderer in `official_avatar.{h,cc}`,
+adapted from M5Stack's MIT-licensed DefaultAvatar. It appears automatically in
+normal idle/listening/speaking operation. WiFi configuration, activation,
+upgrading, and the fatal-error state remain uncovered. `set_avatar("off")` persists
+through automatic state changes until another face is explicitly requested.
 
-## 3.5. Layer architecture (xiaozhi standard vs stackchan overrides)
+`avatar_activity_policy.h` owns Idle, Listening, Thinking, Speaking, explicit
+visibility, and the 30-second thinking timeout. `Application::SetDeviceState`
+notifies the board synchronously, including same-state resets. Audio DeviceState
+stays Idle during remote processing. Gateway `avatar_activity` messages report
+thinking and completion separately from recording stop. The gateway sends idle
+on STT failure/cancellation/empty output. Successful transcripts wait for speech,
+another recording, or timeout. Audio-hook thinking lasts only for its HTTP call.
 
-The stackchan board (`class StackChanBoard : public WifiBoard`, `stackchan.cc:499`) mixes custom implementations with xiaozhi standard passthrough:
+The renderer composes eye and mouth indices independently. Automatic blinking
+is enabled by default and continues during procedural TTS/mouth animation.
+`set_avatar("idle")` restores the activity expression; other explicit moods
+last until the next activity transition. Touch reverts to the current activity.
+TTS lip movement follows decoded PCM playback energy. The audio-output callback
+stores only atomic level/timing data; rendering stays on the animation timer
+under the display lock. Silence and interruption close the mouth.
 
-### Layer override / passthrough mapping
+`load_avatar_set` optionally selects runtime RGB565 image sets. The build no
+longer compiles static `avatar_images.cc` or ignored `avatar_images.local.cc`.
+Do not generate personal image overrides to fix the default face. Keep existing
+personal assets untouched. Source provenance is recorded in
+`official_avatar.LICENSE` and `official_avatar.cc`.
 
-| Layer | xiaozhi standard | stackchan behavior | Effect |
-|---|---|---|---|
-| Display backend | `Board::GetDisplay()` | Override → `SpiLcdDisplay` (ILI9342 320x240) | Standard LVGL rendering |
-| Status bar | `SetStatus(...)` | Passthrough | Chinese status text, hidden by avatar when active |
-| Emotion icon | `SetEmotion(...)` | Passthrough | Hidden by avatar when active |
-| **Avatar (custom)** | N/A | `avatar_img_` LVGL image, foreground, 320x240 | Covers all standard UI when active |
-| **LED** | `GetLed()` → `NoLed` | No override → NoLed passthrough | **LED does not reflect state** |
-| **Mouth animation (custom)** | N/A | `OnTtsStart/Stop` → lip-sync | Active during speaking only |
-| **Touch reactive face (custom)** | N/A | `TouchPollTick` → surprised/embarrassed | 1.2-1.5 second face change on TAP / STROKE |
-| Backlight | `GetBacklight()` → `nullptr` | Override → `CustomBacklight(pmic_)` | Auto-dim via PowerSaveLevel |
-| Camera | `GetCamera()` → `nullptr` | Override → `camera_` | MCP `take_photo` |
-| Audio codec | `GetAudioCodec()` → `nullptr` | Override → AW88298 + ES7210 | TTS + mic |
+Host policy tests run with `firmware/host_test`. The separate
+`firmware/host_test/avatar_preview` target builds pinned LVGL, checks actual
+framebuffer pixels, and exports preview frames. Commands are in the README
+Avatar section. Check timing, interruptions, setup visibility, and speaker/mouth
+synchronization on hardware before release.
 
-### State observation guide
-
-| State | Deterministic observation | NOT reliable |
-|---|---|---|
-| idle / listening | MCP `get_device_status` state field, serial log | LCD avatar (no auto-switch), LED (NoLed) |
-| speaking | Serial log `tts.start`/`tts.stop`, mouth animation | LED |
-| touch reaction | LCD avatar (surprised/embarrassed), serial `touch event:` | LED, MCP state (unchanged) |
-| WS connection | Serial log `WS connected/disconnected`, gateway `/health` | Avatar-covered LCD status |
-
-**Central rule**: deterministic state observation uses **MCP `get_device_status` + serial monitor log**. LCD and LED are supplementary only.
-
-### Placeholder avatar ("Chinese face" symptom)
-
-If `avatar_images.local.cc` was not generated before build, the placeholder (1x1 black pixel) is used. The avatar layer renders as 2x2 pixels, exposing the xiaozhi default Chinese UI underneath. Fix:
-
-```bash
-cd firmware
-python scripts/avatar_convert/convert_avatars.py
-rm -rf build releases/*.zip
-# rebuild and reflash
-```
-
-The `sanity_check.sh` Step 7 detects this before flash.
+MCP `get_device_status` and serial logs remain the source for audio state.
+The displayed Thinking activity is intentionally separate from audio Idle.
+`GetLed()` still returns NoLed; LED behavior is not a state indicator.
 
 ## 4. License boundary (GPL-3.0 vs MIT)
 
@@ -206,5 +199,5 @@ For general failures (build/NVS/WS/sleep), see `firmware/AGENTS.md`. These are s
 | Touch triggers WS disconnect | `CloseAudioChannel()` in listening state | PR #136 (pending). See § 3 |
 | Quick tap doesn't trigger wobble | TAP (< 400 ms) vs STROKE (≥ 400 ms) | Hold ≥ 0.4s. See § 2 |
 | Wobble drives pitch to end-stop | `target_pitch = 0` hardcode bug | Fixed in PR #176. See § 2 |
-| Chinese UI visible instead of avatar | `avatar_images.local.cc` not generated | Run `convert_avatars.py`, rebuild. See § 3.5 |
+| System UI visible instead of avatar | Configuration/activation state or explicit avatar off | Inspect device state; after normal startup, `set_avatar("idle")` restores explicit visibility |
 | `smooth_ui_toolkit` component missing | Submodule not initialized in worktree | `git submodule update --init firmware/components/smooth_ui_toolkit` |

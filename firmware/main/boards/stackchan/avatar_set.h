@@ -4,22 +4,9 @@
 #include <cstdint>
 #include <cstddef>
 
-// AvatarSet — runtime-loadable avatar art container in PSRAM.
-//
-// Replaces the compile-time static `avatar_images.{cc,h}` lookup with a
-// dynamic set uploaded from the gateway via WebSocket binary frames.
-// See docs/intent/stackchan_avatar_pipeline.md in the SAIVerse repository
-// for the pipeline design, the load_avatar_set MCP tool, the 3-layer
-// fallback (placeholder / local static / dynamic set), and the rationale
-// for raw-RGB565-only on the firmware side.
-//
-// Coexistence policy:
-//   - Until Load() succeeds at least once, callers should fall back to
-//     the existing static tables in avatar_images.h (= placeholder or
-//     local override). is_loaded() reports the current state.
-//   - This class does NOT consume or modify avatar_images.{cc,h} — it
-//     lives alongside them as a separate path. Existing local-override
-//     users see no behaviour change.
+// Runtime-loaded RGB565 image sets provide an optional alternative to the
+// official procedural avatar. The board selects these only after a successful
+// load_avatar_set fetch. No compile-time placeholder or local images are used.
 
 class AvatarSet {
 public:

@@ -210,3 +210,13 @@ gtest_discover_tests(power_save_timer_test
 )
 gtest_discover_tests(touch_gesture_test)
 gtest_discover_tests(power_save_gate_test)
+
+add_executable(avatar_activity_policy_test test_avatar_activity_policy.cc)
+target_include_directories(avatar_activity_policy_test PRIVATE ../main)
+target_link_libraries(avatar_activity_policy_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(avatar_activity_policy_test)
+
+add_executable(playback_envelope_test test_playback_envelope.cc)
+target_include_directories(playback_envelope_test PRIVATE ../main)
+target_link_libraries(playback_envelope_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(playback_envelope_test)

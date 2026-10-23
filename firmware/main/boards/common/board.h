@@ -6,6 +6,7 @@
 #include <mqtt.h>
 #include <udp.h>
 #include <string>
+#include <cstdint>
 #include <functional>
 #include <network_interface.h>
 
@@ -13,6 +14,8 @@
 #include "backlight.h"
 #include "camera.h"
 #include "assets.h"
+#include "avatar_activity.h"
+#include "device_state.h"
 
 /**
  * Network events for unified callback
@@ -86,6 +89,10 @@ public:
     // Phase 4 audio (Issue #76): TTS playback hooks. Default no-op so non-
     // stackchan boards are unaffected; boards with an avatar / mouth display
     // override these to drive lip-sync animation while TTS audio is playing.
+    virtual void OnDeviceStateChanged(DeviceState state) { (void)state; }
+    virtual void OnAvatarActivity(AvatarActivity activity) { (void)activity; }
+    // Runs on the audio output task; publish the level without blocking.
+    virtual void OnAudioPlaybackLevel(uint8_t level) { (void)level; }
     virtual void OnTtsStart() {}
     virtual void OnTtsStop() {}
 

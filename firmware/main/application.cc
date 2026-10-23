@@ -83,6 +83,17 @@ Application::Application()
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+    esp_timer_create_args_t drain_timer_args = {
+        .callback = [](void* arg) {
+            auto* app = static_cast<Application*>(arg);
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_PLAYBACK_DRAIN);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "playback_drain",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&drain_timer_args, &playback_drain_timer_));
 }
 
 Application::~Application() {
@@ -93,11 +104,18 @@ Application::~Application() {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
     }
+    esp_timer_stop(playback_drain_timer_);
+    esp_timer_delete(playback_drain_timer_);
     vEventGroupDelete(event_group_);
 }
 
 bool Application::SetDeviceState(DeviceState state) {
-    return state_machine_.TransitionTo(state);
+    const bool accepted = state_machine_.TransitionTo(state);
+    if (accepted) {
+        if (state != kDeviceStateSpeaking) CancelPendingTtsStop();
+        Board::GetInstance().OnDeviceStateChanged(state);
+    }
+    return accepted;
 }
 
 void Application::Initialize() {
@@ -116,6 +134,9 @@ void Application::Initialize() {
     audio_service_.Start();
 
     AudioServiceCallbacks callbacks;
+    callbacks.on_playback_level = [&board](uint8_t level) {
+        board.OnAudioPlaybackLevel(level);
+    };
     callbacks.on_send_queue_available = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
@@ -222,7 +243,8 @@ void Application::Run() {
         MAIN_EVENT_START_LISTENING |
         MAIN_EVENT_STOP_LISTENING |
         MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED;
+        MAIN_EVENT_STATE_CHANGED |
+        MAIN_EVENT_PLAYBACK_DRAIN;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -287,6 +309,8 @@ void Application::Run() {
                 task();
             }
         }
+
+        if (bits & MAIN_EVENT_PLAYBACK_DRAIN) FinishTtsPlaybackIfDrained();
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
@@ -576,10 +600,25 @@ void Application::InitializeProtocol() {
             camera->GrantStreamCredits(
                 static_cast<uint32_t>(credits->valuedouble)
             );
+        } else if (strcmp(type->valuestring, "avatar_activity") == 0) {
+            const auto* state = cJSON_GetObjectItem(root, "state");
+            if (!cJSON_IsString(state)) return;
+            AvatarActivity activity;
+            if (strcmp(state->valuestring, "thinking") == 0) {
+                activity = AvatarActivity::Thinking;
+            } else if (strcmp(state->valuestring, "idle") == 0) {
+                activity = AvatarActivity::Idle;
+            } else {
+                return;
+            }
+            Schedule([activity]() {
+                Board::GetInstance().OnAvatarActivity(activity);
+            });
         } else if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this, &board]() {
+                    CancelPendingTtsStop();
                     aborted_ = false;
                     board.OnUserActivity();
                     SetDeviceState(kDeviceStateSpeaking);
@@ -590,40 +629,16 @@ void Application::InitializeProtocol() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this, &board]() {
-                    if (GetDeviceState() == kDeviceStateSpeaking) {
-                        // stackchan-mcp is an MCP gateway, not a standalone
-                        // xiaozhi-style conversational agent. Listening must
-                        // be triggered explicitly — either by the user
-                        // (touch / button / external command) or by the
-                        // AI (gateway-issued StartListening). The upstream
-                        // xiaozhi behaviour of automatically re-entering
-                        // listening after every TTS utterance is a footgun
-                        // here: when the firmware's TTS pipeline stalls
-                        // (e.g. audio_input task watchdog timeouts during
-                        // long playback) the deferred tts.stop event lands
-                        // long after the user expected the conversation to
-                        // be quiescent, and the device then records ~30 s
-                        // of ambient room audio that the gateway happily
-                        // posts as a user utterance.
-                        //
-                        // Returning to Idle here forces the listening
-                        // boundary to be set explicitly by whoever wants
-                        // to continue the conversation (user touch,
-                        // gateway-driven push-to-talk, etc.). Loop-style
-                        // Listening→Speaking→Listening flows belong on
-                        // the gateway side, not in this firmware.
-                        SetDeviceState(kDeviceStateIdle);
+                    if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
+                        tts_stop_pending_.store(true);
+                        // Network completion can precede the final decoded/output frame.
+                        esp_timer_stop(playback_drain_timer_);
+                        esp_timer_start_periodic(playback_drain_timer_, 40 * 1000);
+                        FinishTtsPlaybackIfDrained();
+                    } else {
+                        if (GetDeviceState() == kDeviceStateSpeaking) SetDeviceState(kDeviceStateIdle);
+                        board.OnTtsStop();
                     }
-                    // Phase 4 audio (Issue #76): stop the avatar mouth
-                    // animation unconditionally on tts.stop. A wake-word /
-                    // button interrupt can call AbortSpeaking() and move
-                    // the device out of Speaking before the server's
-                    // tts.stop arrives, in which case the previous-state
-                    // guard above is false but the audio playback has
-                    // ended and the mouth animation must still stop.
-                    // OnTtsStop() is idempotent (no-op for boards without
-                    // an avatar / when lip-sync is already stopped).
-                    board.OnTtsStop();
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
@@ -665,7 +680,12 @@ void Application::InitializeProtocol() {
                     StartListening(profile);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                StopListening();
+                InvalidatePendingListeningRequest();
+                // Keep stop ahead of subsequent avatar activity in the same FIFO.
+                Schedule([this]() {
+                    InvalidatePendingListeningRequest();
+                    HandleStopListeningEvent();
+                });
             } else {
                 ESP_LOGW(TAG, "Unknown listen state: %s", state->valuestring);
             }
@@ -1167,9 +1187,23 @@ void Application::Schedule(std::function<void()>&& callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
+void Application::CancelPendingTtsStop() {
+    tts_stop_pending_.store(false);
+    if (playback_drain_timer_ != nullptr) esp_timer_stop(playback_drain_timer_);
+}
+
+void Application::FinishTtsPlaybackIfDrained() {
+    if (!tts_stop_pending_.load() || !audio_service_.IsPlaybackIdle()) return;
+    CancelPendingTtsStop();
+    if (GetDeviceState() == kDeviceStateSpeaking) SetDeviceState(kDeviceStateIdle);
+    Board::GetInstance().OnTtsStop();
+}
+
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    CancelPendingTtsStop();
+    Board::GetInstance().OnTtsStop();
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }

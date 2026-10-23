@@ -31,7 +31,9 @@ using ScsBus = SCSCL;
 // Treat ACK timeout as failure to keep the original behaviour intact.
 static inline bool ServoWritePosOk(int r) { return r > 0; }
 #endif
-#include "avatar_images.h"
+#include "official_avatar.h"
+#include "audio/playback_envelope.h"
+#include "avatar_activity_policy.h"
 #include "avatar_set.h"
 #include "avatar_set_fetcher.h"
 #include "head_spring_motion.h"
@@ -799,13 +801,13 @@ private:
     ScsBus scs_bus_;
     std::unique_ptr<Py32IoExpander> io_expander_;
 
-    // Avatar overlay state. avatar_img_ is created lazily on the active LVGL
-    // screen because the screen tree (container_, emoji_label_, ...) is built
-    // by Application::Start() -> Display::SetupUI(), which runs after this
-    // board's constructor completes. avatar_init_timer_ retries every 500 ms
-    // until the screen is ready, then stops itself.
+    // Renderer objects are created after SetupUI and remain hidden during system screens.
     lv_obj_t* avatar_img_ = nullptr;
-    esp_timer_handle_t avatar_init_timer_ = nullptr;
+    esp_timer_handle_t avatar_activity_timer_ = nullptr;
+    stackchan::OfficialAvatar official_avatar_;
+    stackchan::AvatarActivityPolicy avatar_activity_;
+    std::mutex avatar_activity_mutex_;
+    std::atomic<bool> avatar_visible_{false};
     std::string current_avatar_face_ = "idle";
 
     // Board-local listening cue shown above the full-screen avatar layer.
@@ -814,42 +816,15 @@ private:
     std::atomic<bool> listening_indicator_visible_{false};
     static constexpr int LISTENING_INDICATOR_DOT_SIZE_PX = 14;
 
-    // Dynamic avatar set loaded via the load_avatar_set MCP tool. Stays
-    // unloaded by default — the index-based image lookups then fall back
-    // to the static const tables in avatar_images.h (placeholder or local
-    // override). See docs/intent/stackchan_avatar_pipeline.md in the
-    // SAIVerse repository.
+    // Downloaded image sets remain an explicit override of the official renderer.
     AvatarSet avatar_set_;
 
-    // ---- Avatar rendering state (Phase 4.5-a) -----------------------------
-    //
-    // The avatar is represented as three independent axes — face, eyes,
-    // mouth — each carrying a 0-indexed slot identical to AvatarSet's
-    // GetFace / GetEyes / GetMouth layout. The on-screen image is then
-    // derived from this state in a mode-aware way (RenderAvatarLocked):
-    //
-    //   - Layered mode (or AvatarSet not loaded): there is no compositor
-    //     on the firmware side — avatar_img_ shows exactly one image at a
-    //     time. active_layer_ selects which axis drives the current frame
-    //     (face during rest / mouth during set_mouth / eyes during blink),
-    //     matching the upstream Phase 2 behaviour where blink temporarily
-    //     replaces the face image and is then restored.
-    //   - Matrix mode: avatar_set_.GetMatrix(face, eyes, mouth) returns the
-    //     pre-composed image for the current (face, eyes, mouth) triple.
-    //     active_layer_ is ignored; every state change updates the
-    //     composed frame.
-    //
-    // Indices remain valid across mode switches so a future load_avatar_set
-    // call into a different mode does not lose the persona's current
-    // expression. current_avatar_face_ is kept as the string form because
-    // existing internal callers (touch reactions, SetAvatarOff resume,
-    // mouth-sequence restore) still address the face by name.
     enum class ActiveLayer : uint8_t {
         FACE = 0,
         EYES = 1,
         MOUTH = 2,
     };
-    int current_face_index_ = 0;   // 0..5  (idle / happy / thinking / sad / surprised / embarrassed)
+    int current_face_index_ = 0;   // Six emotions plus listening and speaking.
     int current_eyes_index_ = 0;   // 0..2  (open / half / closed) — 0 is the resting state
     int current_mouth_index_ = 0;  // 0..4  (closed / half / open / e / u) — 0 is the resting state
     ActiveLayer active_layer_ = ActiveLayer::FACE;
@@ -892,31 +867,14 @@ private:
     esp_timer_handle_t blink_step_timer_ = nullptr;
     BlinkState blink_state_ = BlinkState::IDLE;
     bool blink_enabled_ = false;
-    // Captures blink_enabled_ at the moment SetAvatarOff() runs, so that a
-    // later set_avatar(<other face>) can restore the previous blink state.
-    // Only meaningful while current_avatar_face_ == "off".
-    bool blink_enabled_before_off_ = false;
 
-    // Phase 4 audio (Issue #76): state-driven TTS lip-sync animation.
-    // Driven by the gateway's tts.start / tts.stop notifications (see
-    // Application::OnIncomingJson) via Board::OnTtsStart / OnTtsStop;
-    // cycles the mouth through closed -> half -> open -> half on a fixed
-    // TTS_LIPSYNC_STEP_MS cadence until stopped. Autonomous blink is paused
-    // while active (same Phase 2 trade-off as the mouth-sequence task: a
-    // blink ending would otherwise restore the full-face image and overwrite
-    // the mouth overlay). The user's most recent blink intent is read from
-    // blink_desired_ at stop so a set_blink call issued during playback is
-    // honoured.
-    enum class TtsLipSyncShape : uint8_t {
-        CLOSED = 0,
-        HALF_RISING,   // closed -> open transition
-        OPEN,
-        HALF_FALLING,  // open -> closed transition
-    };
-    static constexpr int TTS_LIPSYNC_STEP_MS = 150;
     esp_timer_handle_t tts_lipsync_timer_ = nullptr;
     std::atomic<bool> tts_lipsync_active_{false};
-    TtsLipSyncShape tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
+    std::atomic<uint32_t> playback_level_{0};
+    std::atomic<uint32_t> playback_level_at_ms_{0};
+    // Smoothing and rendered aperture are protected by the display lock.
+    stackchan::audio::PlaybackEnvelope playback_envelope_;
+    int playback_mouth_opening_ = -1;
 
     // Phase 7: Si12T head-touch sensing.
     // TouchPollTick() samples CH1..CH3 every TOUCH_POLL_MS and feeds
@@ -5106,7 +5064,7 @@ private:
     // does not re-cover the LCD after the user explicitly hid it.
     static void TouchRevertCb(void* arg) {
         StackChanBoard* self = static_cast<StackChanBoard*>(arg);
-        self->SetAvatarExpressionIfActive("idle");
+        self->ApplyAvatarActivity();
     }
 
     void ScheduleIdleRevert(int hold_ms) {
@@ -5295,6 +5253,8 @@ private:
         if (strcmp(face, "sad") == 0)         return 3;
         if (strcmp(face, "surprised") == 0)   return 4;
         if (strcmp(face, "embarrassed") == 0) return 5;
+        if (strcmp(face, "listening") == 0)   return 6;
+        if (strcmp(face, "speaking") == 0)    return 7;
         return -1;
     }
 
@@ -5310,63 +5270,16 @@ private:
         return -1;
     }
 
-    // ---- Layered-mode image lookups (face / eyes / mouth) -----------------
-    //
-    // Resolution order for each axis:
-    //   1. If a dynamic AvatarSet has been loaded in layered mode, use
-    //      its GetFace / GetEyes / GetMouth lookup. nullptr from AvatarSet
-    //      is treated as "not in this set"; we fall through to (2).
-    //   2. Static const tables in avatar_images.h (placeholder by default;
-    //      avatar_images.local.cc swaps in real art for static-art users).
-    //
-    // Matrix-mode rendering uses avatar_set_.GetMatrix() directly inside
-    // RenderAvatarLocked() and bypasses these helpers entirely.
-
     const lv_image_dsc_t* FaceImageForIndex(int face_index) const {
-        if (avatar_set_.is_loaded() &&
-            avatar_set_.mode() == AvatarSet::Mode::kLayered) {
-            const lv_image_dsc_t* dsc = avatar_set_.GetFace(face_index);
-            if (dsc != nullptr) return dsc;
-        }
-        switch (face_index) {
-            case 0: return &avatar_idle;
-            case 1: return &avatar_happy;
-            case 2: return &avatar_thinking;
-            case 3: return &avatar_sad;
-            case 4: return &avatar_surprised;
-            case 5: return &avatar_embarrassed;
-            default: return nullptr;
-        }
+        return avatar_set_.GetFace(face_index >= 6 ? (face_index == 7 ? 1 : 0) : face_index);
     }
 
     const lv_image_dsc_t* EyesImageForIndex(int eyes_index) const {
-        if (avatar_set_.is_loaded() &&
-            avatar_set_.mode() == AvatarSet::Mode::kLayered) {
-            const lv_image_dsc_t* dsc = avatar_set_.GetEyes(eyes_index);
-            if (dsc != nullptr) return dsc;
-        }
-        switch (eyes_index) {
-            case 0: return &avatar_eyes_open;
-            case 1: return &avatar_eyes_half;
-            case 2: return &avatar_eyes_closed;
-            default: return nullptr;
-        }
+        return avatar_set_.GetEyes(eyes_index);
     }
 
     const lv_image_dsc_t* MouthImageForIndex(int mouth_index) const {
-        if (avatar_set_.is_loaded() &&
-            avatar_set_.mode() == AvatarSet::Mode::kLayered) {
-            const lv_image_dsc_t* dsc = avatar_set_.GetMouth(mouth_index);
-            if (dsc != nullptr) return dsc;
-        }
-        switch (mouth_index) {
-            case 0: return &avatar_mouth_closed;
-            case 1: return &avatar_mouth_half;
-            case 2: return &avatar_mouth_open;
-            case 3: return &avatar_mouth_e;
-            case 4: return &avatar_mouth_u;
-            default: return nullptr;
-        }
+        return avatar_set_.GetMouth(mouth_index);
     }
 
     // Central mode-aware renderer. Caller must hold the display lock.
@@ -5380,10 +5293,26 @@ private:
     // loaded in matrix mode but the index triple is out of range, or the
     // avatar lv_obj cannot be created yet because the screen tree isn't up).
     bool RenderAvatarLocked() {
+        if (!avatar_visible_.load(std::memory_order_acquire)) {
+            official_avatar_.SetHidden(true);
+            if (avatar_img_) lv_obj_add_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+            return true;
+        }
+        if (!avatar_set_.is_loaded()) {
+            if (!official_avatar_.EnsureCreated(lv_screen_active())) return false;
+            if (avatar_img_) lv_obj_add_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+            official_avatar_.Render(current_face_index_, current_eyes_index_, current_mouth_index_,
+                                    playback_mouth_opening_);
+            official_avatar_.SetHidden(false);
+            lv_obj_move_foreground(official_avatar_.root());
+            BringListeningIndicatorToFrontLocked();
+            return true;
+        }
+        official_avatar_.SetHidden(true);
         const lv_image_dsc_t* dsc = nullptr;
         if (avatar_set_.is_loaded() &&
             avatar_set_.mode() == AvatarSet::Mode::kMatrix) {
-            dsc = avatar_set_.GetMatrix(current_face_index_,
+            dsc = avatar_set_.GetMatrix(current_face_index_ >= 6 ? (current_face_index_ == 7 ? 1 : 0) : current_face_index_,
                                         current_eyes_index_,
                                         current_mouth_index_);
         } else {
@@ -5401,6 +5330,7 @@ private:
         }
         if (dsc == nullptr) return false;
         if (!EnsureAvatarObject()) return false;
+        lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(avatar_img_, dsc);
         lv_obj_move_foreground(avatar_img_);
         BringListeningIndicatorToFrontLocked();
@@ -5502,7 +5432,7 @@ private:
             return;
         }
         if (pending.has_face) {
-            SetAvatarExpression(pending.face_name.c_str());
+            SetAvatarExpression(pending.face_name.c_str(), false);
         }
         if (pending.has_mouth) {
             SetMouthShape(pending.mouth_shape.c_str());
@@ -5556,121 +5486,93 @@ private:
         return true;
     }
 
-    // Public-style entry that takes the display lock. Used by the MCP tool
-    // and by the deferred init timer. Always safe to call from any task.
-    //
-    // Also handles the "resume from off" path: if the previous face was
-    // "off" (avatar layer hidden), the layer is unhidden here, and if blink
-    // was enabled before SetAvatarOff() ran it is restored automatically.
-    bool SetAvatarExpression(const char* face) {
-        if (display_ == nullptr) {
-            ESP_LOGW(TAG, "SetAvatarExpression('%s') ignored: display_ not ready", face);
-            return false;
+    bool SetAvatarExpression(const char* face, bool explicit_request = true) {
+        if (display_ == nullptr || FaceNameToIndex(face) < 0) return false;
+        bool resume_lip_sync = false;
+        if (explicit_request) {
+            std::lock_guard<std::mutex> lock(avatar_activity_mutex_);
+            avatar_activity_.SetEnabled(true);
+            resume_lip_sync = avatar_activity_.activity() == AvatarActivity::Speaking;
+            face = avatar_activity_.ResolveExplicitFace(face);
+            avatar_visible_.store(avatar_activity_.visible(), std::memory_order_release);
         }
-        // Avatar set fetch in progress — record the request and return
-        // success. ApplyPendingAvatarAfterFetch() will replay the latest
-        // captured face when the fetch completes.
-        if (DeferAvatarFaceIfFetching(face)) {
-            return true;
-        }
-        bool was_off = (current_avatar_face_ == "off");
+        if (DeferAvatarFaceIfFetching(face)) return true;
         bool ok;
         {
             DisplayLockGuard lock(display_);
-            if (avatar_img_ != nullptr) {
-                // Restore visibility if a previous SetAvatarOff() hid the
-                // layer. Cheap no-op when the flag is already clear.
-                lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
-            }
             ok = SetAvatarExpressionLocked(face);
         }
-        if (!ok) {
-            ESP_LOGW(TAG, "SetAvatarExpression('%s') deferred (face unknown or screen not ready)", face);
-            return ok;
-        }
-        // Coming back from "off": if blink was on before going off, restart
-        // it so the user does not have to re-issue set_blink. The default
-        // experience is "blink follows the avatar".
-        if (was_off && blink_enabled_before_off_) {
+        if (ok && blink_desired_.load(std::memory_order_acquire) && !blink_enabled_) {
             StartBlinkTimer();
-            ESP_LOGI(TAG, "Blink restored after avatar resume from OFF");
         }
-        blink_enabled_before_off_ = false;
+        if (ok && resume_lip_sync) StartTtsLipSync();
         return ok;
     }
 
-    // Hide the avatar layer and disable blink so the underlying
-    // xiaozhi-esp32 screens (WiFi config UI, OTA, settings) become visible.
-    // The avatar lv_obj is kept allocated so a subsequent
-    // SetAvatarExpression(<other face>) can re-show it cheaply, and the
-    // previous blink state is remembered for restoration.
     bool SetAvatarOff() {
-        if (display_ == nullptr) {
-            ESP_LOGW(TAG, "SetAvatarOff() ignored: display_ not ready");
-            return false;
-        }
-        if (DeferAvatarOffIfFetching()) {
-            return true;
-        }
-        // Capture the previous blink state only on the first transition
-        // into "off". A repeated set_avatar("off") while already off must
-        // not overwrite the saved state with the post-off (always-false)
-        // blink_enabled_.
-        if (current_avatar_face_ != "off") {
-            blink_enabled_before_off_ = blink_enabled_;
-        }
-        // StopBlinkTimer() takes the display lock internally for the
-        // resting-face restore step, so call it before grabbing our lock.
-        StopBlinkTimer();
         {
-            DisplayLockGuard lock(display_);
-            if (avatar_img_ != nullptr) {
-                lv_obj_add_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
-            }
+            std::lock_guard<std::mutex> lock(avatar_activity_mutex_);
+            avatar_activity_.SetEnabled(false);
+            avatar_visible_.store(false, std::memory_order_release);
         }
+        RequestMouthSequenceCancel();
+        StopTtsLipSync();
+        StopBlinkTimer();
+        DeferAvatarOffIfFetching();
+        if (display_ == nullptr) return false;
+        DisplayLockGuard lock(display_);
         current_avatar_face_ = "off";
-        ESP_LOGI(TAG, "Avatar OFF: hidden + blink disabled (was %s)",
-                 blink_enabled_before_off_ ? "ON" : "OFF");
-        return true;
+        current_mouth_index_ = 0;
+        return RenderAvatarLocked();
     }
 
-    // Internal-only entry used by autonomous animations (touch reactions,
-    // idle revert, etc.). Skips the face change while the avatar is in
-    // the user-requested "off" state, so the underlying xiaozhi-esp32
-    // screens remain visible. Returns true if the face was applied.
     bool SetAvatarExpressionIfActive(const char* face) {
-        if (current_avatar_face_ == "off") {
-            ESP_LOGD(TAG, "SetAvatarExpressionIfActive('%s') skipped: avatar is OFF", face);
-            return false;
-        }
-        return SetAvatarExpression(face);
+        if (!avatar_visible_.load(std::memory_order_acquire)) return false;
+        return SetAvatarExpression(face, false);
     }
 
-    // Schedule a one-shot/periodic timer that keeps trying to install the
-    // initial avatar image until the LVGL screen tree is ready (i.e. after
-    // Application::Start() has run Display::SetupUI()).
+    void ApplyAvatarActivity() {
+        const char* face;
+        bool visible;
+        {
+            std::lock_guard<std::mutex> lock(avatar_activity_mutex_);
+            face = avatar_activity_.face();
+            visible = avatar_activity_.visible();
+            avatar_visible_.store(visible, std::memory_order_release);
+        }
+        if (!visible) {
+            RequestMouthSequenceCancel();
+            StopTtsLipSync();
+            StopBlinkTimer();
+            if (display_) {
+                DisplayLockGuard lock(display_);
+                current_mouth_index_ = 0;
+                current_eyes_index_ = 0;
+                RenderAvatarLocked();
+            }
+            return;
+        }
+        SetAvatarExpression(face, false);
+    }
+
     void InitializeAvatar() {
-        ESP_LOGI(TAG, "Schedule avatar init (deferred until SetupUI completes)");
-        esp_timer_create_args_t timer_args = {
+        esp_timer_create_args_t args = {
             .callback = [](void* arg) {
-                StackChanBoard* board = static_cast<StackChanBoard*>(arg);
-                if (board->SetAvatarExpression("idle")) {
-                    ESP_LOGI(TAG, "Initial avatar (idle) installed");
-                    if (board->avatar_init_timer_ != nullptr) {
-                        esp_timer_stop(board->avatar_init_timer_);
-                    }
+                auto* board = static_cast<StackChanBoard*>(arg);
+                bool expired;
+                {
+                    std::lock_guard<std::mutex> lock(board->avatar_activity_mutex_);
+                    expired = board->avatar_activity_.ExpireThinking(esp_timer_get_time() / 1000);
                 }
+                if (expired) board->ApplyAvatarActivity();
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
-            .name = "avatar_init",
+            .name = "avatar_activity",
             .skip_unhandled_events = true,
         };
-        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &avatar_init_timer_));
-        // Retry every 500 ms; SetupUI() typically completes within a few
-        // hundred ms after Application::Start(). Once installed the callback
-        // stops the timer.
-        ESP_ERROR_CHECK(esp_timer_start_periodic(avatar_init_timer_, 500 * 1000));
+        ESP_ERROR_CHECK(esp_timer_create(&args, &avatar_activity_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(avatar_activity_timer_, 1000 * 1000));
     }
 
     // ---- Phase 2: parts (eyes / mouth) and blink state machine ----------
@@ -5710,6 +5612,7 @@ private:
         }
         DisplayLockGuard lock(display_);
         current_mouth_index_ = idx;
+        playback_mouth_opening_ = -1;
         active_layer_ = ActiveLayer::MOUTH;
         return RenderAvatarLocked();
     }
@@ -5723,7 +5626,7 @@ private:
     }
 
     void BlinkStepAdvance() {
-        if (display_ == nullptr) {
+        if (display_ == nullptr || !avatar_visible_.load(std::memory_order_acquire)) {
             blink_state_ = BlinkState::IDLE;
             return;
         }
@@ -5768,7 +5671,7 @@ private:
     }
 
     void BlinkScheduleTick() {
-        if (blink_enabled_ && blink_state_ == BlinkState::IDLE && display_ != nullptr) {
+        if (blink_enabled_ && avatar_visible_.load(std::memory_order_acquire) && blink_state_ == BlinkState::IDLE && display_ != nullptr) {
             // Begin the blink: half-down now, full-closed at next step.
             DisplayLockGuard lock(display_);
             current_eyes_index_ = 1;  // half
@@ -5812,6 +5715,10 @@ private:
     }
 
     void StartBlinkTimer() {
+        if (!avatar_visible_.load(std::memory_order_acquire) ||
+            avatar_fetch_in_progress_.load(std::memory_order_acquire) ||
+            (avatar_set_.is_loaded() && (mouth_seq_active_.load(std::memory_order_acquire) ||
+                                        tts_lipsync_active_.load(std::memory_order_acquire)))) return;
         EnsureBlinkTimers();
         blink_enabled_ = true;
         // Make sure no leftover schedule timer is running, then arm one with
@@ -5841,70 +5748,31 @@ private:
         ESP_LOGI(TAG, "Blink DISABLED");
     }
 
-    // ---- Phase 4 audio (Issue #76): TTS state-driven lip-sync ----------
-    //
-    // While the gateway is playing TTS audio (tts.start..tts.stop), cycle
-    // the mouth shape through CLOSED -> HALF -> OPEN -> HALF on a fixed
-    // TTS_LIPSYNC_STEP_MS cadence. This is the (A) state-driven approach
-    // proposed in Issue #76; the (B) audio-envelope-driven follow-up will
-    // replace this cycle with a per-frame amplitude mapping in a separate
-    // change.
-    //
-    // Concurrency:
-    //   - Single esp_timer self-rearming on ESP_TIMER_TASK.
-    //   - Coexists with the mouth-sequence playback task: when
-    //     mouth_seq_active_ is true (the user issued a set_mouth_sequence
-    //     while we were animating), the lip-sync step yields its frame and
-    //     re-arms; the user-issued sequence wins until it completes, then
-    //     lip-sync resumes naturally on the next tick.
-    //   - Pauses autonomous blink while active (same Phase 2 reasoning as
-    //     the mouth-sequence task: BlinkStepAdvance()'s
-    //     RestoreCurrentFaceLocked() would overwrite the mouth overlay).
-    //     Restores blink at stop based on blink_desired_ so a set_blink
-    //     issued mid-playback is honoured.
+    // Output PCM drives the mouth independently of blinking. Manual sequences
+    // take priority; downloaded full-frame image sets still pause blinking.
     static void TtsLipSyncStepCb(void* arg) {
         static_cast<StackChanBoard*>(arg)->TtsLipSyncStepAdvance();
     }
 
     void TtsLipSyncStepAdvance() {
-        if (!tts_lipsync_active_.load(std::memory_order_acquire)) {
-            return;
+        if (display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (!tts_lipsync_active_.load(std::memory_order_acquire)) return;
+        if (!mouth_seq_active_.load(std::memory_order_acquire) &&
+            !avatar_fetch_in_progress_.load(std::memory_order_acquire)) {
+            const uint32_t sample_ms = playback_level_at_ms_.load(std::memory_order_acquire);
+            const int opening = playback_envelope_.Advance(
+                playback_level_.load(std::memory_order_relaxed), sample_ms,
+                static_cast<uint32_t>(esp_timer_get_time() / 1000));
+            if (opening != playback_mouth_opening_) {
+                playback_mouth_opening_ = opening;
+                current_mouth_index_ = opening == 0 ? 0 : (opening < 65 ? 1 : 2);
+                active_layer_ = ActiveLayer::MOUTH;
+                RenderAvatarLocked();
+            }
         }
-        if (display_ == nullptr) {
-            return;
-        }
-        // Yield to an in-flight user-issued mouth sequence; re-arm so we
-        // resume on our cadence as soon as the sequence finishes.
-        if (mouth_seq_active_.load(std::memory_order_acquire)) {
-            esp_timer_start_once(tts_lipsync_timer_,
-                                 (uint64_t)TTS_LIPSYNC_STEP_MS * 1000);
-            return;
-        }
-        const char* shape = nullptr;
-        switch (tts_lipsync_shape_) {
-            case TtsLipSyncShape::CLOSED:
-                shape = "half";
-                tts_lipsync_shape_ = TtsLipSyncShape::HALF_RISING;
-                break;
-            case TtsLipSyncShape::HALF_RISING:
-                shape = "open";
-                tts_lipsync_shape_ = TtsLipSyncShape::OPEN;
-                break;
-            case TtsLipSyncShape::OPEN:
-                shape = "half";
-                tts_lipsync_shape_ = TtsLipSyncShape::HALF_FALLING;
-                break;
-            case TtsLipSyncShape::HALF_FALLING:
-            default:
-                shape = "closed";
-                tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
-                break;
-        }
-        SetMouthShape(shape);
-        if (tts_lipsync_active_.load(std::memory_order_acquire)) {
-            esp_timer_start_once(tts_lipsync_timer_,
-                                 (uint64_t)TTS_LIPSYNC_STEP_MS * 1000);
-        }
+        esp_timer_start_once(tts_lipsync_timer_,
+            stackchan::audio::PlaybackEnvelope::kTickMs * 1000);
     }
 
     void EnsureTtsLipSyncTimer() {
@@ -5921,66 +5789,42 @@ private:
     }
 
     void StartTtsLipSync() {
-        if (display_ == nullptr) {
-            ESP_LOGD(TAG, "StartTtsLipSync ignored: display_ not ready");
-            return;
-        }
+        if (display_ == nullptr || !avatar_visible_.load(std::memory_order_acquire) ||
+            tts_lipsync_active_.load(std::memory_order_acquire)) return;
         EnsureTtsLipSyncTimer();
-        if (tts_lipsync_active_.exchange(true, std::memory_order_acq_rel)) {
-            // Already active (e.g. duplicate tts.start); nothing to do.
-            return;
+        if (avatar_set_.is_loaded()) StopBlinkTimer();
+        DisplayLockGuard lock(display_);
+        if (!avatar_visible_.load(std::memory_order_acquire) ||
+            tts_lipsync_active_.load(std::memory_order_acquire)) return;
+        playback_level_.store(0, std::memory_order_relaxed);
+        playback_level_at_ms_.store(0, std::memory_order_release);
+        playback_envelope_.Reset();
+        tts_lipsync_active_.store(true, std::memory_order_release);
+        if (!mouth_seq_active_.load(std::memory_order_acquire)) {
+            playback_mouth_opening_ = 0;
+            current_mouth_index_ = 0;
+            active_layer_ = ActiveLayer::MOUTH;
+            RenderAvatarLocked();
         }
-        // Pause autonomous blink so BlinkStepAdvance()'s
-        // RestoreCurrentFaceLocked() does not overwrite the mouth overlay.
-        // blink_desired_ remembers the user's intent for restore at stop.
-        StopBlinkTimer();
-        // Start the cycle from a known resting position so the first audible
-        // frame opens the mouth from closed.
-        tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
-        SetMouthShape("closed");
         esp_timer_start_once(tts_lipsync_timer_,
-                             (uint64_t)TTS_LIPSYNC_STEP_MS * 1000);
-        ESP_LOGI(TAG, "TTS lip-sync STARTED (cycle=%d ms)",
-                 TTS_LIPSYNC_STEP_MS);
+            stackchan::audio::PlaybackEnvelope::kTickMs * 1000);
     }
 
     void StopTtsLipSync() {
-        if (!tts_lipsync_active_.exchange(false, std::memory_order_acq_rel)) {
-            return;  // already stopped
-        }
-        if (tts_lipsync_timer_ != nullptr) {
+        if (display_ == nullptr) return;
+        {
+            DisplayLockGuard lock(display_);
+            if (!tts_lipsync_active_.exchange(false, std::memory_order_acq_rel)) return;
             esp_timer_stop(tts_lipsync_timer_);
+            playback_envelope_.Reset();
+            playback_level_.store(0, std::memory_order_relaxed);
+            playback_mouth_opening_ = -1;
+            if (mouth_seq_active_.load(std::memory_order_acquire)) return;
+            current_mouth_index_ = 0;
+            active_layer_ = ActiveLayer::MOUTH;
+            RenderAvatarLocked();
         }
-        // If a user-issued mouth sequence is in flight (we were yielding
-        // our frames to it via the mouth_seq_active_ guard in
-        // TtsLipSyncStepAdvance), let the sequence task own both the
-        // mouth shape and the blink restore at sequence end. Touching
-        // either here would race the sequence:
-        //   - SetMouthShape("closed") would clobber the user's current
-        //     frame mid-sequence;
-        //   - StartBlinkTimer() would let BlinkStepAdvance()'s
-        //     RestoreCurrentFaceLocked() overwrite the mouth overlay
-        //     before the sequence finishes drawing (Phase 2 trade-off).
-        // The sequence task already restores blink from blink_desired_
-        // at its own end (see MouthSequenceTaskLoop), so deferring is
-        // safe and idempotent.
-        if (mouth_seq_active_.load(std::memory_order_acquire)) {
-            ESP_LOGI(TAG,
-                     "TTS lip-sync STOPPED (mouth_seq active; deferring "
-                     "mouth + blink restore to sequence end)");
-            return;
-        }
-        // Snap back to a closed mouth so the device does not freeze on a
-        // half-open frame.
-        if (display_ != nullptr) {
-            SetMouthShape("closed");
-        }
-        // Restore blink based on the user's most recent intent (mirrors the
-        // mouth-sequence playback task's restore semantics).
-        if (blink_desired_.load(std::memory_order_acquire)) {
-            StartBlinkTimer();
-        }
-        ESP_LOGI(TAG, "TTS lip-sync STOPPED");
+        if (blink_desired_.load(std::memory_order_acquire)) StartBlinkTimer();
     }
 
     // ---- Phase 2: lip-sync sequence playback (Issue #5) ----------------
@@ -6012,10 +5856,8 @@ private:
     //     `steps_json`. Validation happens here once, atomically: if any
     //     step is malformed the whole call is rejected and nothing is
     //     queued (no half-played sequences).
-    //   - Autonomous blink is paused while a sequence plays because the
-    //     blink state machine ends by calling RestoreCurrentFaceLocked(),
-    //     which would replace the active mouth overlay with the resting
-    //     face image (see Phase 2 comment near BlinkStepAdvance()).
+    //   - Downloaded image sets pause blink during a sequence because their
+    //     part frames replace the whole face. Official eyes remain independent.
     //   - The final shape is held after the sequence finishes; callers
     //     that want the mouth to close at the end should append a
     //     {"closed", N} step explicitly. This keeps the primitive composable
@@ -6059,7 +5901,7 @@ private:
     // sequence end iff this is true. Without this split a set_blink
     // call issued during a sequence is silently overwritten by the
     // pre-sequence snapshot when the task finishes.
-    std::atomic<bool> blink_desired_{false};
+    std::atomic<bool> blink_desired_{true};
 
     // Mark any in-flight or pending sequence for cancellation. Safe to
     // call from any thread. Takes mouth_seq_lock_ so that:
@@ -6213,13 +6055,7 @@ private:
                 continue;
             }
 
-            // Pause autonomous blink for the duration of the sequence so
-            // BlinkStepAdvance()'s RestoreCurrentFaceLocked() does not
-            // overwrite the active mouth overlay. Note: we no longer
-            // snapshot blink_enabled_ here — the user's intent is read
-            // from blink_desired_ at sequence end so calls to set_blink
-            // made during playback are honoured.
-            StopBlinkTimer();
+            if (avatar_set_.is_loaded()) StopBlinkTimer();
 
             for (const auto& step : seq) {
                 // Re-check cancel + generation right before each frame
@@ -6227,7 +6063,8 @@ private:
                 // previous SetMouthShape() will be observed here, so we
                 // never draw a frame after a newer set_mouth / set_avatar
                 // / set_mouth_sequence handler has returned to the caller.
-                if (mouth_seq_cancel_requested_.load(std::memory_order_acquire) ||
+                if (!avatar_visible_.load(std::memory_order_acquire) ||
+                    mouth_seq_cancel_requested_.load(std::memory_order_acquire) ||
                     mouth_seq_generation_.load(std::memory_order_acquire) != my_generation) {
                     break;
                 }
@@ -6245,14 +6082,6 @@ private:
                 }
             }
 
-            // Restore blink according to the user's most recent intent,
-            // not a snapshot taken before the sequence started. This way
-            // a set_blink(true/false) issued during the sequence is the
-            // one that wins at the end.
-            if (blink_desired_.load(std::memory_order_acquire)) {
-                StartBlinkTimer();
-            }
-
             // If a fresh sequence was enqueued during playback, the
             // cancel path above will have left it in mouth_seq_pending_.
             // Self-signal so the next outer-loop iteration picks it up
@@ -6263,6 +6092,7 @@ private:
                 has_more = !mouth_seq_pending_.empty();
                 xSemaphoreGive(mouth_seq_lock_);
             }
+            if (blink_desired_.load(std::memory_order_acquire)) StartBlinkTimer();
             if (has_more) {
                 xSemaphoreGive(mouth_seq_signal_);
             }
@@ -7157,7 +6987,8 @@ private:
             "'off' hides the avatar and disables blink so the underlying "
             "xiaozhi-esp32 screens (WiFi config UI, OTA, settings) are "
             "visible; calling set_avatar with another face brings the avatar "
-            "back and restores the previous blink state.",
+            "back and restores the requested blink state. idle resumes the current "
+            "conversation activity expression.",
             PropertyList({Property("face", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string face = properties["face"].value<std::string>();
@@ -7172,7 +7003,7 @@ private:
                     // interrupts cleanly)").
                     RequestMouthSequenceCancel();
                     applied = SetAvatarOff();
-                } else if (FaceNameToIndex(face.c_str()) >= 0) {
+                } else if (FaceNameToIndex(face.c_str()) >= 0 && FaceNameToIndex(face.c_str()) < 6) {
                     RequestMouthSequenceCancel();
                     applied = SetAvatarExpression(face.c_str());
                 } else {
@@ -7199,7 +7030,8 @@ private:
             "self.display.set_mouth",
             "Set the avatar mouth shape. mouth must be one of: "
             "closed, half, open, e, u. Held until the next set_avatar/set_mouth, "
-            "or until a blink restores the resting face.",
+            "with independent blinking on the official avatar. Downloaded image "
+            "sets may restore the resting face after a blink.",
             PropertyList({Property("mouth", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string mouth = properties["mouth"].value<std::string>();
@@ -7244,15 +7076,10 @@ private:
             "items, shape in {closed, half, open, e, u}, duration_ms in "
             "10..10000). Returns immediately; calling set_mouth, set_avatar, "
             "or this tool again interrupts the in-flight sequence. "
-            "Autonomous blink is paused while a sequence plays and resumed "
-            "when it ends (resume reads the user's most recent set_blink "
-            "intent, not a snapshot). The final shape is held until the "
-            "next set_mouth / set_avatar call, or until the next autonomous "
-            "blink restores the resting face — the same Phase 2 trade-off "
-            "that applies to set_mouth, since blink ends by repainting the "
-            "full face. If the final shape must persist visually, disable "
-            "blink with set_blink(false) before the sequence (or append a "
-            "closed step if you just want the mouth to close at the end).",
+            "The official avatar blinks independently while the mouth moves. "
+            "Downloaded image sets pause blink until the sequence ends. "
+            "The final mouth shape is held; append a closed step to close it. "
+            "Sequences stop when the avatar is hidden or speech is interrupted.",
             PropertyList({Property("steps_json", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string steps_json = properties["steps_json"].value<std::string>();
@@ -7282,7 +7109,7 @@ private:
             "self.display.set_blink",
             "Enable or disable autonomous eye blinking on the avatar. "
             "When enabled, a brief blink animation runs every 3-6 seconds. "
-            "If a set_mouth_sequence is currently playing, blink is paused "
+            "For downloaded image sets, if a mouth sequence is playing, blink is paused "
             "until the sequence ends; this call still records the intent "
             "and is applied at the sequence end (or immediately if no "
             "sequence is running).",
@@ -7297,7 +7124,7 @@ private:
                 blink_desired_.store(enabled, std::memory_order_release);
                 bool deferred_by_fetch =
                     DeferAvatarBlinkIfFetching(enabled);
-                bool deferred_by_mouth_seq =
+                bool deferred_by_mouth_seq = avatar_set_.is_loaded() &&
                     mouth_seq_active_.load(std::memory_order_acquire);
                 if (!deferred_by_fetch && !deferred_by_mouth_seq) {
                     if (enabled) {
@@ -8474,9 +8301,7 @@ public:
         InitializeTouchSettings();
         InitializeSi12tTouch();
         I2cDetect();
-        // Avatar auto-display disabled: WiFi config UI needs to be visible.
-        // Avatar is shown on-demand via MCP set_avatar command.
-        // InitializeAvatar();
+        InitializeAvatar();
         InitializeMouthSequenceTask();
         RegisterMcpTools();
     }
@@ -8530,12 +8355,43 @@ public:
     // Phase 4 audio (Issue #76): drive avatar mouth animation alongside TTS
     // playback. The gateway's tts.start / tts.stop notifications reach this
     // board via Application::OnIncomingJson() -> Board::OnTtsStart/Stop().
+    virtual void OnDeviceStateChanged(DeviceState state) override {
+        {
+            std::lock_guard<std::mutex> lock(avatar_activity_mutex_);
+            avatar_activity_.OnDeviceState(state);
+            avatar_visible_.store(avatar_activity_.visible(), std::memory_order_release);
+        }
+        if (state != kDeviceStateSpeaking) {
+            RequestMouthSequenceCancel();
+            StopTtsLipSync();
+            SetMouthShape("closed");
+        }
+        ApplyAvatarActivity();
+    }
+
+    virtual void OnAvatarActivity(AvatarActivity activity) override {
+        {
+            std::lock_guard<std::mutex> lock(avatar_activity_mutex_);
+            if (!avatar_activity_.OnActivity(activity, esp_timer_get_time() / 1000)) return;
+        }
+        ApplyAvatarActivity();
+    }
+
+    virtual void OnAudioPlaybackLevel(uint8_t level) override {
+        if (!tts_lipsync_active_.load(std::memory_order_acquire)) return;
+        playback_level_.store(level, std::memory_order_relaxed);
+        playback_level_at_ms_.store(static_cast<uint32_t>(esp_timer_get_time() / 1000),
+                                    std::memory_order_release);
+    }
+
     virtual void OnTtsStart() override {
         StartTtsLipSync();
     }
 
     virtual void OnTtsStop() override {
+        RequestMouthSequenceCancel();
         StopTtsLipSync();
+        SetMouthShape("closed");
     }
 
     // Phase 4.5 avatar (saiverse-stackchan-addon): handle the gateway's
@@ -8690,6 +8546,7 @@ public:
         // restoration happens last so a successful fetch doesn't restart
         // blink if the user disabled it mid-fetch.
         ApplyPendingAvatarAfterFetch();
+        if (blink_desired_.load(std::memory_order_acquire)) StartBlinkTimer();
     }
 
     static void SendAvatarSetLoaded(

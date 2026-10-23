@@ -826,18 +826,11 @@ endif()
 
 if(CONFIG_BOARD_TYPE_STACKCHAN)
     set(STACKCHAN_BOARD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/boards/stackchan)
-    set(STACKCHAN_LOCAL_AVATAR_CC ${STACKCHAN_BOARD_DIR}/avatar_images.local.cc)
-    set(STACKCHAN_LOCAL_AVATAR_H ${STACKCHAN_BOARD_DIR}/avatar_images.local.h)
-    if(EXISTS ${STACKCHAN_LOCAL_AVATAR_CC})
-        if(NOT EXISTS ${STACKCHAN_LOCAL_AVATAR_H})
-            message(FATAL_ERROR
-                "Found ${STACKCHAN_LOCAL_AVATAR_CC} but ${STACKCHAN_LOCAL_AVATAR_H} is missing. "
-                "Regenerate both files with scripts/avatar_convert/convert_avatars.py."
-            )
-        endif()
-        list(REMOVE_ITEM BOARD_SOURCES ${STACKCHAN_BOARD_DIR}/avatar_images.cc)
-        message(STATUS "Using StackChan local avatar override: ${STACKCHAN_LOCAL_AVATAR_CC}")
-    endif()
+    # The default avatar is procedural. Image sets are loaded explicitly at runtime.
+    list(REMOVE_ITEM BOARD_SOURCES
+        ${STACKCHAN_BOARD_DIR}/avatar_images.cc
+        ${STACKCHAN_BOARD_DIR}/avatar_images.local.cc
+    )
 
     # Issue #79: when the experimental MIT FeetechScs driver is selected,
     # exclude the GPL-3.0 SCServo_lib sources from the build so the firmware

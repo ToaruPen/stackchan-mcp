@@ -2674,6 +2674,10 @@ async def test_device_driven_listen_pushes_to_hook(manager_with_hook):
             await asyncio.sleep(0.05)
             if calls:
                 break
+        notifications = [json.loads(await asyncio.wait_for(ws.recv(), 1)) for _ in range(2)]
+        assert [(msg["type"], msg["state"]) for msg in notifications] == [
+            ("avatar_activity", "thinking"), ("avatar_activity", "idle")
+        ]
 
     assert len(calls) == 1
     assert calls[0]["hook_url"] == "http://test/hook"
@@ -2749,3 +2753,99 @@ async def test_device_driven_listen_cleanup_on_disconnect(manager_with_hook):
     assert not is_recording(), "recording slot was leaked across connections"
     # No push should have fired for the aborted capture.
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_avatar_activity_routes_to_exact_device_without_default_fallback():
+    manager = ESP32Manager()
+    first_ws, second_ws = _FakeWebSocket(), _FakeWebSocket()
+    first = ESP32Connection(first_ws, "first-session")
+    second = ESP32Connection(second_ws, "second-session")
+    manager._register_connection(first, "first")
+    manager._register_connection(second, "second")
+    await manager.send_avatar_activity("thinking", device_id="second")
+    await manager.send_avatar_activity("idle", device_id="missing")
+    assert first_ws.sent == []
+    assert [json.loads(msg) for msg in second_ws.sent] == [{
+        "session_id": "second-session", "type": "avatar_activity", "state": "thinking"
+    }]
+
+
+@pytest.mark.asyncio
+async def test_avatar_activity_send_failure_is_best_effort():
+    class BrokenWebSocket(_FakeWebSocket):
+        async def send(self, data):
+            raise ConnectionError("closed")
+
+    conn = ESP32Connection(BrokenWebSocket(), "session")
+    await conn.send_avatar_activity("thinking")
+    conn.disconnect()
+    await conn.send_avatar_activity("idle")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [True, False, "cancel"])
+async def test_audio_hook_activity_brackets_post_and_clears_on_completion(monkeypatch, outcome):
+    manager = ESP32Manager()
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, "session")
+    manager._register_connection(conn, "device")
+
+    async def push(*args, **kwargs):
+        assert [json.loads(msg)["state"] for msg in ws.sent] == ["thinking"]
+        if outcome == "cancel":
+            raise asyncio.CancelledError()
+        return outcome
+
+    monkeypatch.setattr(esp32_client, "push_audio_capture", push)
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await manager._push_audio_capture_with_activity(conn, [b"audio"], 0)
+    else:
+        await manager._push_audio_capture_with_activity(conn, [b"audio"], 0)
+    assert [json.loads(msg)["state"] for msg in ws.sent] == ["thinking", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["new_capture", "replacement", "default"])
+async def test_old_audio_hook_completion_does_not_clear_new_capture_or_replacement(
+    monkeypatch, change
+):
+    manager = ESP32Manager()
+    ws, other_ws = _FakeWebSocket(), _FakeWebSocket()
+    conn = ESP32Connection(ws, "session")
+    other = ESP32Connection(other_ws, "other-session")
+    manager._register_connection(conn, "device")
+
+    async def push(*args, **kwargs):
+        if change == "new_capture":
+            await conn.send_listen_state("start")
+        elif change == "replacement":
+            manager._register_connection(other, "device")
+        else:
+            manager._register_connection(other, "other")
+            manager.set_default_device("other")
+        return True
+
+    monkeypatch.setattr(esp32_client, "push_audio_capture", push)
+    await manager._push_audio_capture_with_activity(conn, [b"audio"], 0)
+    states = [json.loads(msg)["state"] for msg in ws.sent]
+    assert states == (["thinking", "idle"] if change == "default" else (
+        ["thinking", "start"] if change == "new_capture" else ["thinking"]
+    ))
+    assert other_ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_empty_audio_hook_capture_does_not_notify_or_post(monkeypatch):
+    manager = ESP32Manager()
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, "session")
+    manager._register_connection(conn, "device")
+
+    async def unexpected_push(*args, **kwargs):
+        pytest.fail("empty capture must not be posted")
+
+    monkeypatch.setattr(esp32_client, "push_audio_capture", unexpected_push)
+    await manager._push_audio_capture_with_activity(conn, [], 0)
+    assert ws.sent == []

@@ -287,6 +287,11 @@ rename with no loss of your configuration.
 
 ## License Boundary
 
+The procedural avatar in `firmware/main/boards/stackchan/official_avatar.{h,cc}`
+is adapted from M5Stack's official StackChan DefaultAvatar. Preserve its SPDX
+headers and `official_avatar.LICENSE`. The reference commit is recorded in the
+source and README.
+
 Most of this repository is MIT licensed. The SCServo-lib-derived files under
 `firmware/main/boards/stackchan/` are GPL-3.0:
 
