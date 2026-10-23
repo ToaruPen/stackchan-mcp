@@ -685,6 +685,7 @@ void McpServer::DoToolCall(
         arguments = std::move(arguments)
     ]() {
         try {
+            Board::GetInstance().OnUserActivity();
             const uint64_t apply_started_at_us =
                 static_cast<uint64_t>(esp_timer_get_time());
             std::string result = (*tool_iter)->Call(arguments);

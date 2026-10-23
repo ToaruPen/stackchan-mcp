@@ -10,13 +10,14 @@ from contextlib import AsyncExitStack
 import inspect
 import json
 import logging
+import os
 from typing import Any, Literal, cast
 
 import anyio
 from mcp.server import InitializationOptions, NotificationOptions, Server
 from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
-from mcp.types import Notification, TextContent, Tool
+from mcp.types import ImageContent, Notification, TextContent, Tool
 
 from . import __version__
 from .gateway import get_gateway
@@ -924,11 +925,33 @@ async def _dispatch_mcp_tool(
     name: str,
     arguments: dict[str, Any],
     gateway: Any,
-) -> list[TextContent]:
+) -> list[TextContent | ImageContent]:
     """Run one StackChan MCP tool against the provided gateway instance."""
+    # Optional multi-device routing key (declared by _with_device_id_schema);
+    # strip so it never reaches ESP32.
+    device_id = arguments.pop("device_id", None)
+    if device_id is not None and not isinstance(device_id, str):
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {"error": f"device_id must be a string (got {device_id!r})"}
+                ),
+            )
+        ]
+    if isinstance(device_id, str) and not device_id:
+        device_id = None
+
     if name == "get_status":
         status = gateway.esp32.get_status()
         return [TextContent(type="text", text=json.dumps(status, indent=2))]
+
+    if name in {"camera_stream", "stackchan_face_follow", "stackchan_head_target_lane"}:
+        if device_id is not None and device_id != gateway.esp32.default_device_id:
+            return [TextContent(
+                type="text",
+                text=json.dumps({"error": "This tool operates on the default device only"}),
+            )]
 
     if name == "camera_stream":
         action = arguments.get("action", "status")
@@ -988,9 +1011,41 @@ async def _dispatch_mcp_tool(
             ]
         return [TextContent(type="text", text=json.dumps(status))]
 
+    if name == "list_devices":
+        devices = gateway.esp32.list_devices()
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "devices": devices,
+                        "default_device_id": gateway.esp32.default_device_id,
+                    },
+                    indent=2,
+                ),
+            )
+        ]
+
+    if name == "set_default_device":
+        target = arguments.get("device_id", device_id)
+        if not isinstance(target, str) or not target:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {"ok": False, "error": "device_id is required"}
+                    ),
+                )
+            ]
+        result = gateway.esp32.set_default_device(target)
+        return [TextContent(type="text", text=json.dumps(result))]
+
+
     if name == "say":
         try:
-            result = await synthesize_and_send(arguments, gateway=gateway)
+            result = await synthesize_and_send(
+                arguments, gateway=gateway, device_id=device_id
+            )
         except (ValueError, NotImplementedError, RuntimeError) as exc:
             return [
                 TextContent(
@@ -1002,7 +1057,9 @@ async def _dispatch_mcp_tool(
 
     if name == "listen":
         try:
-            result = await listen_and_transcribe(arguments, gateway=gateway)
+            result = await listen_and_transcribe(
+                arguments, gateway=gateway, device_id=device_id
+            )
         except (ValueError, NotImplementedError, RuntimeError) as exc:
             return [
                 TextContent(
@@ -1035,7 +1092,29 @@ async def _dispatch_mcp_tool(
                     text=json.dumps({"ok": False, "error": f"unknown mode: {mode}"}),
                 )
             ]
-        result = await gateway.load_avatar_set(archive_path, mode, timeout)
+        result = await gateway.load_avatar_set(
+            archive_path, mode, timeout, device_id=device_id
+        )
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    if name == "upgrade_firmware":
+        firmware_path = arguments.get("firmware_path", "")
+        if not firmware_path or not isinstance(firmware_path, str):
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {"ok": False, "error": "firmware_path is required"}
+                    ),
+                )
+            ]
+        try:
+            timeout = float(arguments.get("timeout", 180.0))
+        except (TypeError, ValueError):
+            timeout = 180.0
+        result = await gateway.upgrade_firmware(
+            firmware_path, timeout, device_id=device_id
+        )
         return [TextContent(type="text", text=json.dumps(result))]
 
     if name == "stackchan_follow_pose_stream":
@@ -1180,6 +1259,34 @@ async def _dispatch_mcp_tool(
         ),
         "set_brightness": (
             "self.screen.set_brightness",
+            arguments,
+        ),
+        "set_off_timeout": (
+            "self.screen.set_off_timeout",
+            arguments,
+        ),
+        "get_off_timeout": (
+            "self.screen.get_off_timeout",
+            {},
+        ),
+        "set_external_power_auto_off": (
+            "self.power.set_external_power_auto_off",
+            arguments,
+        ),
+        "get_external_power_auto_off": (
+            "self.power.get_external_power_auto_off",
+            {},
+        ),
+        "set_charge_protection": (
+            "self.power.set_charge_protection",
+            arguments,
+        ),
+        "get_charge_protection": (
+            "self.power.get_charge_protection",
+            {},
+        ),
+        "set_charge_thresholds": (
+            "self.power.set_charge_thresholds",
             arguments,
         ),
         "move_head": (
@@ -1345,7 +1452,10 @@ async def _dispatch_mcp_tool(
         ]
 
     esp32_name, esp32_args = tool_map[name]
-    result, error = await gateway.esp32.call_tool(esp32_name, esp32_args)
+    # device_id was stripped above; route to the selected (or default) device.
+    result, error = await gateway.esp32.call_tool(
+        esp32_name, esp32_args, device_id=device_id
+    )
 
     if error:
         return [
@@ -1363,11 +1473,119 @@ async def _dispatch_mcp_tool(
                 if isinstance(item, dict) and item.get("type") == "text":
                     texts.append(item.get("text", ""))
             if texts:
-                return [TextContent(type="text", text="\n".join(texts))]
+                joined = "\n".join(texts)
+                if name == "take_photo":
+                    return _photo_contents(joined)
+                return [TextContent(type="text", text=joined)]
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return [TextContent(type="text", text=str(result))]
+
+
+#: Refuse to inline images beyond this size — tool receipts should stay
+#: small for LLM clients (base64 of 200 KB ≈ 270 KB of text). ESP32
+#: camera JPEGs are a few KB, so this cap only guards against
+#: pathological captures.
+_PHOTO_INLINE_MAX_BYTES = 200 * 1024
+
+
+def _photo_contents(result_text: str) -> list[TextContent | ImageContent]:
+    """take_photo receipt → text + inline ImageContent.
+
+    The capture JSON carries ``image_path``. Returning the JPEG as an MCP
+    image block alongside the text lets LLM clients actually see the
+    frame instead of only reading a file path they may not be able to
+    reach. Any failure to inline degrades to the original text-only
+    receipt.
+
+    ``image_path`` originates in a device response, so only files inside
+    the capture directory are eligible — the gateway must not inline an
+    arbitrary readable local file on a malformed or hostile device's say-so.
+    """
+    import base64
+
+    from .capture_server import CAPTURE_DIR
+
+    out: list[TextContent | ImageContent] = [
+        TextContent(type="text", text=result_text)
+    ]
+    try:
+        payload = json.loads(result_text)
+        image_path = payload.get("image_path") if isinstance(payload, dict) else None
+        if isinstance(image_path, str) and image_path:
+            resolved = os.path.realpath(image_path)
+            capture_root = os.path.realpath(CAPTURE_DIR)
+            if not resolved.startswith(capture_root + os.sep):
+                logger.warning(
+                    "take_photo inline image skipped: %s is outside the "
+                    "capture directory",
+                    image_path,
+                )
+                return out
+            with open(resolved, "rb") as f:
+                raw = f.read()
+            if raw[:2] == b"\xff\xd8" and len(raw) <= _PHOTO_INLINE_MAX_BYTES:
+                out.append(
+                    ImageContent(
+                        type="image",
+                        data=base64.b64encode(raw).decode(),
+                        mimeType="image/jpeg",
+                    )
+                )
+            else:
+                logger.info(
+                    "take_photo inline image skipped: %s is %s",
+                    image_path,
+                    "not a JPEG"
+                    if raw[:2] != b"\xff\xd8"
+                    else f"{len(raw)} bytes (cap {_PHOTO_INLINE_MAX_BYTES})",
+                )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("take_photo inline image skipped: %s", exc)
+    return out
+
+
+# Tools that never take a per-call device_id: gateway-local status/registry
+# tools and the streaming/beat helpers, which always act on the default device.
+DEVICE_ID_EXEMPT_TOOLS = frozenset(
+    {
+        "get_status",
+        "list_devices",
+        "set_default_device",
+        "camera_stream",
+        "stackchan_face_follow",
+        "stackchan_head_target_lane",
+        "stackchan_follow_pose_stream",
+        "stackchan_follow_led_stream",
+        "beat_mode_start",
+        "beat_mode_stop",
+        "beat_mode_update",
+        "beat_meta_snapshot",
+        "beat_clip_save",
+    }
+)
+
+_DEVICE_ID_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Optional Device-Id of the connected ESP32 to target (see "
+        "list_devices). Omit to use the default device."
+    ),
+}
+
+
+def _with_device_id_schema(tools: list[Tool]) -> list[Tool]:
+    """Declare the optional ``device_id`` routing argument on routed tools."""
+    for tool in tools:
+        if tool.name in DEVICE_ID_EXEMPT_TOOLS:
+            continue
+        schema = dict(tool.inputSchema)
+        properties = dict(schema.get("properties") or {})
+        properties.setdefault("device_id", dict(_DEVICE_ID_SCHEMA))
+        schema["properties"] = properties
+        tool.inputSchema = schema
+    return tools
 
 
 def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
@@ -1384,7 +1602,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
         Tools prefixed with ESP32 names (self.*) are relayed to the device.
         get_status is handled locally by the gateway.
         """
-        return [
+        tools = [
             Tool(
                 name="get_status",
                 description=(
@@ -1394,6 +1612,41 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 inputSchema={
                     "type": "object",
                     "properties": {},
+                },
+            ),
+            Tool(
+                name="list_devices",
+                description=(
+                    "List ESP32 devices currently connected to the gateway. "
+                    "Returns each device_id (from the Device-Id header), "
+                    "connection time, and which one is the default routing target. "
+                    "Use set_default_device to change the default; pass optional "
+                    "device_id on other tools to target a specific unit."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="set_default_device",
+                description=(
+                    "Set the default ESP32 destination used when tools omit "
+                    "device_id. Until set, the default is the first device that "
+                    "connected. Returns an error if the device_id is not connected."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "device_id": {
+                            "type": "string",
+                            "description": (
+                                "Device-Id of a currently connected ESP32 "
+                                "(see list_devices)."
+                            ),
+                        },
+                    },
+                    "required": ["device_id"],
                 },
             ),
             Tool(
@@ -1500,6 +1753,129 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["brightness"],
+                },
+            ),
+            Tool(
+                name="set_off_timeout",
+                description=(
+                    "Set the idle screen-off timeout in seconds (0-86400). "
+                    "Default: 300; 0 disables screen-off. Saved in NVS and "
+                    "preserved across reboots. Requires firmware 1.17.0 or later."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "seconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 86400,
+                        },
+                    },
+                    "required": ["seconds"],
+                },
+            ),
+            Tool(
+                name="get_off_timeout",
+                description=(
+                    "Get the persistent idle screen-off timeout in seconds. "
+                    "0 means disabled; default: 300. "
+                    "Requires firmware 1.17.0 or later."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_external_power_auto_off",
+                description=(
+                    "Persist and immediately apply whether the device also "
+                    "dims (60 s idle) and powers off (300 s idle) while on "
+                    "external power. Off by default: on external power it "
+                    "never does this automatically; on battery it always does. "
+                    "Requires firmware-v1.18.0 or later."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": (
+                                "True to dim and power off on idle even on "
+                                "external power; false to stay on while "
+                                "powered."
+                            ),
+                        },
+                    },
+                    "required": ["enabled"],
+                },
+            ),
+            Tool(
+                name="get_external_power_auto_off",
+                description=(
+                    "Get the persistent external_power_auto_off setting, "
+                    "whether the battery is discharging, and whether the "
+                    "idle dim/power-off timer is running. "
+                    "Requires firmware-v1.18.0 or later."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_charge_protection",
+                description=(
+                    "Persist and immediately apply battery charge protection. "
+                    "Protection is opt-in by default and uses the persisted "
+                    "ON/OFF thresholds. Disable it temporarily before going out to "
+                    "allow the AXP2101 charger to reach its own full-charge "
+                    "termination; enable it again to resume protection."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": (
+                                "True for persistent threshold protection; "
+                                "false to allow charging to the PMIC's "
+                                "full-charge termination."
+                            ),
+                        },
+                    },
+                    "required": ["enabled"],
+                },
+            ),
+            Tool(
+                name="get_charge_protection",
+                description=(
+                    "Get the persistent and effective charge_protection "
+                    "setting, thresholds, and current charger-enable state. "
+                    "The setting is opt-in when it has never been saved."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="set_charge_thresholds",
+                description=(
+                    "Persist and immediately apply charge-protection thresholds. "
+                    "on_below must be lower than off_above."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "on_below": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Enable charging at or below this percentage.",
+                        },
+                        "off_above": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Disable charging at or above this percentage.",
+                        },
+                    },
+                    "required": ["on_below", "off_above"],
                 },
             ),
             Tool(
@@ -2617,7 +2993,8 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         "voice": {
                             "type": "string",
                             "description": (
-                                "Engine identifier (e.g. 'voicevox', 'irodori'). "
+                                "Engine identifier (e.g. 'voicevox', 'irodori', "
+                                "'elevenlabs'). "
                                 "Default 'voicevox'."
                             ),
                             "default": "voicevox",
@@ -2698,10 +3075,12 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         "language": {
                             "type": "string",
                             "description": (
-                                "ISO 639-1 language code (e.g. 'ja'). Pass "
-                                "an empty string or omit for autodetect."
+                                "ISO 639-1 language code (e.g. 'ja', 'en'). "
+                                "Omit this field to use STACKCHAN_LISTEN_LANGUAGE, "
+                                "or 'ja' when that env is unset. Do not rely on a "
+                                "schema default — many clients send defaults even "
+                                "when the caller did not choose a language."
                             ),
-                            "default": "ja",
                         },
                         "model": {
                             "type": "string",
@@ -3128,10 +3507,54 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "required": ["archive_path", "mode"],
                 },
             ),
+            Tool(
+                name="upgrade_firmware",
+                description=(
+                    "Flash new firmware to the device over Wi-Fi (no USB). "
+                    "``firmware_path`` is a local app image on the gateway "
+                    "host (``build/xiaozhi.bin`` or the Release asset "
+                    "``xiaozhi.bin``; not merged-binary.bin). The gateway "
+                    "first checks it is an ESP32-S3 xiaozhi image for this "
+                    "board with a valid SHA-256 and that it fits the OTA "
+                    "slot, and refuses it otherwise without contacting the "
+                    "device. It then serves the file once from a random, "
+                    "short-lived URL on the capture port, asks the device "
+                    "to download and install it, waits for the reboot and "
+                    "reconnect, and confirms the running image. Returns "
+                    "ok / before / after (version, compile_time, "
+                    "elf_sha256, partition) / error. Takes about a minute."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "firmware_path": {
+                            "type": "string",
+                            "description": (
+                                "Filesystem path on the gateway host to "
+                                "xiaozhi.bin."
+                            ),
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": (
+                                "Max seconds to wait for download, reboot "
+                                "and reconnect."
+                            ),
+                            "default": 180.0,
+                            "minimum": 60.0,
+                            "maximum": 600.0,
+                        },
+                    },
+                    "required": ["firmware_path"],
+                },
+            ),
         ]
+        return _with_device_id_schema(tools)
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
+    async def call_tool(
+        name: str, arguments: dict[str, Any] | None
+    ) -> list[TextContent | ImageContent]:
         """Handle a tool call by relaying to ESP32."""
         arguments = arguments or {}
         return await _dispatch_mcp_tool(name, arguments, get_gateway())

@@ -72,6 +72,10 @@ Edit `.env`:
 - `STACKCHAN_FACE_FOLLOW_MODEL`: explicit local path to a PINTO head/face
   ONNX model. Required only for `stackchan_face_follow(action="start")`.
   The gateway does not auto-download or choose a fallback model.
+- `STACKCHAN_LISTEN_LANGUAGE`: default `listen()` language when the tool
+  call omits `language` (falls back to `ja`). The MCP schema does not
+  advertise a language default. `STACKCHAN_FASTER_WHISPER_*` select the
+  local model; install the `[stt-faster-whisper]` extra.
 
 ## Run
 
@@ -181,11 +185,18 @@ Same shape, under `mcpServers`.
 |---|---|
 | `get_status` | Gateway connection state (ESP32 connected? device info?) |
 | `get_device_info` | ESP32 device status (battery, volume, WiFi, etc.) |
-| `take_photo(question?)` | Trigger camera capture; returns saved JPEG path |
+| `take_photo(question?)` | Trigger camera capture; returns the saved JPEG path plus the image itself as an inline MCP image block |
 | `camera_stream(action, fps?, quality?)` | Start, stop, or inspect the reference-counted latest-JPEG stream. `fps` is `1..20`; `quality` is `1..100`. |
 | `stackchan_face_follow(action)` | Start, inspect, or stop gateway-owned face follow. The MCP host only controls lifecycle; camera, PINTO inference, controller state, and the latest-only head lane remain in this process. Requires `stackchan-mcp[face-follow]`. |
 | `set_volume(volume)` | Speaker volume 0-100 |
 | `set_brightness(brightness)` | Screen brightness 0-100 |
+| `set_off_timeout(seconds)` | Set the idle screen-off timeout (integer 0..86400 seconds; default 300, 0 disables). Applied immediately and saved in NVS across reboots. Requires firmware 1.17.0+ |
+| `get_off_timeout` | Read the effective persistent timeout, whether it is enabled, and whether the screen is off. Requires firmware 1.17.0+ |
+| `set_external_power_auto_off(enabled)` | Persistently choose whether the idle auto-dim (60 s) and auto power-off (300 s) also run on external power. Default `false`: on USB/external power the device stays on; on battery it always dims and powers off when idle. Requires firmware-v1.18.0 or later. |
+| `get_external_power_auto_off` | Read that setting, whether the battery is discharging, and whether the idle dim/power-off timer is running. |
+| `set_charge_protection(enabled)` | Persistently enable/disable the opt-in battery-protection hysteresis. Set `false` before going out when you want the PMIC to finish a full charge. |
+| `get_charge_protection` | Read the persistent/effective protection setting and current charger-enable state. |
+| `set_charge_thresholds(on_below, off_above)` | Persist the charge-protection ON/OFF percentages (defaults: 30/70). |
 | `move_head(yaw, pitch, speed?)` | Drive yaw + pitch servos |
 | `get_head_angles` | Read current yaw + pitch servo angles |
 | `get_touch_state` | Touch sensor state (press/release/stroke) |
@@ -198,6 +209,7 @@ Same shape, under `mcpServers`.
 | `set_all_leds(r, g, b)` | Set all 12 base RGB LEDs to the same color. Updates immediately. |
 | `set_leds(colors)` | Batch-set the first N LEDs from a `[[r,g,b], ...]` array (1..12 entries). Single I2C burst + one latch — use this for animations / multi-color patterns instead of N individual `set_led` calls. Trailing LEDs (beyond `len(colors)`) keep their previous color. Validation is atomic: a malformed entry rejects the whole call without mutating any LED. |
 | `clear_leds` | Turn all 12 base RGB LEDs off. |
+| `upgrade_firmware(firmware_path, timeout?)` | Flash a local `xiaozhi.bin` over Wi-Fi. Pre-flight checks (ESP32-S3 app image, project `xiaozhi`, board name, appended SHA-256, fits the OTA slot) run before the device is contacted; the image is then served once from `/firmware/{random id}` on the capture port (120 s TTL, no auth header, since the device's OTA client sends none), and the tool waits for reboot + reconnect and compares the running ELF SHA-256. Returns `ok`, `before`, `after`, `error`. |
 | `beat_mode_start(motion_intensity?, sensitivity?, color?, duration_sec?)` | Start gateway-side beat mode: capture ambient audio through the existing `listen` wire path, estimate BPM locally, and drive free-running head sway plus base-ring LED flashes. `sensitivity` tunes the onset floor for quiet rooms or loud venues. `listen()` is mutually exclusive while active; `say()` may interrupt and beat mode re-arms listening afterwards. Requires the `[stt]` extra for Opus decoding. |
 | `beat_mode_stop()` | Stop beat mode and retain the latest rolling audio buffer for clip export until the next beat-mode start or gateway restart. |
 | `beat_mode_update(motion_intensity?, sensitivity?, color?, blink_rate?, motion_enabled?, led_enabled?)` | Update beat-mode motion/LED parameters without restarting capture. |
@@ -232,6 +244,44 @@ instead of cascading errors.
 
 The mapping from these names to ESP32-side `self.*` MCP tools is in
 `stackchan_mcp/stdio_server.py`.
+
+### Charge protection
+
+`charge_protection` is opt-in (`false`) when it has never been saved and is
+stored in ESP32 NVS across restarts. With protection on, firmware uses
+NVS-backed thresholds (30%/70% by default): charging is enabled at or below
+the lower value, disabled at or above the upper value, and unchanged between
+them. With protection off, that
+policy no longer stops charging; the AXP2101 charger is enabled and its own
+full-charge termination remains in control. This is useful for topping up
+before leaving home.
+
+```text
+set_charge_protection({"enabled": false})
+get_charge_protection({})
+set_charge_thresholds({"on_below": 35, "off_above": 75})
+set_charge_protection({"enabled": true})
+```
+
+Changes take effect immediately without rebooting. Switching protection back
+on immediately re-evaluates the current battery level. The firmware keeps the
+public names; their physical NVS mapping is namespace `stackchan`, keys
+`chg_protect`, `chg_on_below`, and `chg_off_above`, because ESP-IDF NVS names
+allow at most 15 characters.
+
+### Idle auto-dim / power-off
+
+While no gateway is connected, the firmware dims the screen after 60 s idle
+and powers the device off after 300 s idle. This runs **only on battery** by
+default; on external power (USB) the device stays on.
+`external_power_auto_off` (NVS namespace `stackchan`, key `ext_auto_off`,
+`false` when unset) opts in to the same behaviour on external power as well.
+It takes effect immediately and survives restarts.
+
+```text
+set_external_power_auto_off({"enabled": true})
+get_external_power_auto_off({})
+```
 
 ## Architecture
 

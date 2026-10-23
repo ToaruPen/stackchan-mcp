@@ -120,6 +120,7 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
     callbacks.on_wake_word_detected = [this](const std::string& wake_word) {
+        Board::GetInstance().OnUserActivity();
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
@@ -580,6 +581,7 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this, &board]() {
                     aborted_ = false;
+                    board.OnUserActivity();
                     SetDeviceState(kDeviceStateSpeaking);
                     // Phase 4 audio (Issue #76): drive avatar mouth animation
                     // for the lifetime of this TTS utterance. Default no-op
@@ -678,7 +680,8 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
-                Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
+                Schedule([display, &board, emotion_str = std::string(emotion->valuestring)]() {
+                    board.OnUserActivity();
                     display->SetEmotion(emotion_str.c_str());
                 });
             }
@@ -714,6 +717,7 @@ void Application::InitializeProtocol() {
             // current board for HTTP fetch + SHA256 verify + AvatarSet adoption.
             // Non-stackchan boards default to a no-op (Board::OnAvatarSetFetch).
             // See docs/intent/stackchan_avatar_pipeline.md §C-3 (SAIVerse).
+            board.OnUserActivity();
             board.OnAvatarSetFetch(root);
 #if CONFIG_RECEIVE_CUSTOM_MESSAGE
         } else if (strcmp(type->valuestring, "custom") == 0) {
@@ -786,6 +790,7 @@ void Application::DismissAlert() {
 }
 
 void Application::ToggleChatState() {
+    Board::GetInstance().OnUserActivity();
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
 }
 
@@ -808,6 +813,7 @@ bool Application::IsListeningRequestCurrent(uint32_t generation) const {
 }
 
 void Application::StartListening(ListeningProfile profile) {
+    Board::GetInstance().OnUserActivity();
     // Thin event setter. The popup-on-listening flag is armed inside
     // HandleStartListeningEvent (main task) so all writes to
     // play_popup_on_listening_ converge to the same task that reads
@@ -1250,6 +1256,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+    Board::GetInstance().OnUserActivity();
     if (!protocol_) {
         return;
     }

@@ -64,6 +64,7 @@ jobs:
           set -euo pipefail
           test -f firmware/build/merged-binary.bin
           test -f firmware/releases/v2.2.6_stackchan.zip
+          python3 firmware/scripts/check_mdns_artifacts.py
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
@@ -72,6 +73,7 @@ jobs:
           retention-days: 7
           path: |
             firmware/build/merged-binary.bin
+            firmware/build/xiaozhi.bin
             firmware/releases/v2.2.6_stackchan.zip
 
   firmware-host-test:

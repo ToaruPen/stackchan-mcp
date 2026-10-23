@@ -48,15 +48,17 @@ This repository is a monorepo.
 |---|---|---|
 | `get_status` | Gateway connection state | ✅ |
 | `get_device_info` | ESP32 device state (battery / volume / WiFi / etc.) | ✅ |
-| `take_photo(question?)` | Capture a frame, save as JPEG, return the path | ✅ |
+| `take_photo(question?)` | Capture a frame, save as JPEG, return the path + inline image block | ✅ |
 | `camera_stream(action, fps?, quality?)` | Reference-count an in-memory latest-JPEG stream (`start` / `stop` / `status`). No frame is written to disk. | ✅ |
 | `stackchan_face_follow(action)` | Start, inspect, or stop gateway-owned face follow (`start` / `status` / `stop`). Camera frames, PINTO inference, the controller, and the latest-only head lane stay inside `stackchan-mcp`; the MCP host does not embed them. Requires the `[face-follow]` extra and `STACKCHAN_FACE_FOLLOW_MODEL`. | ✅ |
 | `set_volume(volume)` | Speaker volume (0-100) | ✅ |
 | `set_brightness(brightness)` | Screen brightness (0-100) | ✅ |
+| `set_off_timeout(seconds)` | Persistent idle screen-off timeout (0..86400 seconds; default 300, 0 disables). Requires firmware 1.17.0+ | ✅ |
+| `get_off_timeout` | Read the persistent screen-off timeout and current screen state. Requires firmware 1.17.0+ | ✅ |
 | `move_head(yaw, pitch, speed?)` | Move the neck (servos). `pitch` is constrained to `5..85` — the M5Stack-recommended operating range. For the wider firmware hard clamp (`0..88`), use the firmware-side `set_head_angles` device tool instead. | ✅ |
 | `get_touch_state` | Touch sensor state (press / release / stroke / etc.) | ✅ |
 | `get_touch_sensor_enabled` | Read whether head-touch detection is enabled. The NVS-backed setting persists across reboot. | ✅ |
-| `set_touch_sensor_enabled(enabled)` | Enable or disable head-touch detection. Disabling stops both the firmware local motion response and MCP `stackchan/event` emission, and persists across reboot. | ✅ |
+| `set_touch_sensor_enabled(enabled)` | Enable or disable head-touch detection. Disabling stops both the firmware local motion response and MCP `stackchan/event` emission, and persists across reboot. Head-touch is **off until enabled**. | ✅ |
 | `set_avatar(face)` | Switch avatar expression (`idle` / `happy` / `thinking` / `sad` / `surprised` / `embarrassed`), or `off` to hide the avatar and disable blink so the underlying WiFi config / OTA / settings screens are visible. Any other face brings the avatar back and restores blink. | ✅ |
 | `set_blink(state)` | Blink on/off | ✅ |
 | `set_mouth(state)` | Mouth open/close (one-shot, held until next call) | ✅ |
@@ -74,6 +76,7 @@ This repository is a monorepo.
 | `beat_meta_snapshot()` | Poll the latest beat-mode metadata: active state, BPM, confidence, active sensitivity/minimum onset floor, last beat/audio timestamps, capture health, counters, and current motion/LED parameters. | ✅ |
 | `beat_clip_save(seconds?)` | Save the latest rolling beat-mode audio window as a 16 kHz mono WAV temp file and return its path plus actual captured duration. Clip files persist on disk; the caller is responsible for deleting them when no longer needed. | ✅ |
 | `stackchan_follow_pose_stream(action, url, ...)` | Subscribe to an arbitrary external WebSocket pose-stream and drive the head to follow incoming `yaw` / `pitch` frames 1:1 within the SCS0009 working range. `action` switches between `start` / `stop` / `status`. Includes per-axis flip, pitch-center offset, downsample rate cap, angular-velocity clamp, and reconnect with exponential backoff; the initial pose is seeded from the device so the angular-velocity clamp is anchored at the real servo position from the first frame. The upstream server's protocol (zero-offset commands, source dispatching, transport) is intentionally outside this gateway's scope. | ✅ |
+| `upgrade_firmware(firmware_path, timeout?)` | Flash a local `xiaozhi.bin` to the device over Wi-Fi, no USB cable. The gateway refuses files that are not an ESP32-S3 `xiaozhi` image for this board with a valid SHA-256 that fits the OTA slot, before contacting the device; then serves it once from a random short-lived URL, waits for the reboot and confirms the running image. See [Updating over Wi-Fi](#updating-over-wi-fi-no-usb). | ✅ |
 | `stackchan_follow_led_stream(action, url, target, ...)` | Subscribe to an arbitrary external WebSocket LED-frame stream and forward validated `colors` frames to either the built-in 12-LED base ring or a Port B WS2812 strip. `event` frames bypass the rate gate; `continuous` frames are capped by `max_fps`. | ✅ |
 
 See `gateway/README.md` for full schemas.
@@ -104,6 +107,38 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 -b 460800 \
 ```
 
 No ESP-IDF or Docker setup needed.
+
+#### Updating over Wi-Fi (no USB)
+
+Once the device is connected to your gateway, later updates can skip the
+cable. Call the gateway tool `upgrade_firmware` with the path to the
+app image (`xiaozhi.bin` from a Release or `build/xiaozhi.bin`; not
+`merged-binary.bin`) on the gateway host:
+
+```text
+upgrade_firmware({"firmware_path": "~/Downloads/xiaozhi.bin"})
+```
+
+The gateway first checks the file (ESP32-S3 app image, project
+`xiaozhi`, this board's name, appended SHA-256, fits the 0x3F0000 OTA
+slot) and refuses anything else without touching the device. It then
+serves the file once on the capture port (`CAPTURE_PORT`, default 8766)
+under a random URL that expires after 120 s. The device needs to reach that
+port on the address it uses for the gateway WebSocket. The tool waits for
+the download (~25 s), reboot and reconnect and returns `before` /
+`after` (version, compile time, ELF SHA-256, OTA partition). About a minute
+in total.
+
+The device writes into the inactive OTA slot and only switches over after
+ESP-IDF has verified the image. App rollback is enabled: a new image that
+reboots before it reaches the OTA version check goes back to the previous
+one on the next reset. If the device comes back on a different gateway
+(mDNS order), the tool reports `no_reconnect`; check that gateway.
+
+After an OTA the device may be running from `ota_1` (0x410000). An
+app-only USB flash to `0x20000` then has no effect until the OTA data is
+cleared: add `erase_region 0xd000 0x2000` before `write_flash 0x20000
+xiaozhi.bin` (NVS and Wi-Fi settings are kept).
 
 #### Option B: Build from source with Docker (for contributors)
 
@@ -635,6 +670,105 @@ export STACKCHAN_TTS_ENGINE=irodori
 VOICEVOX remains the default when `STACKCHAN_TTS_ENGINE` is unset, and an
 explicit `voice` argument always overrides the default.
 
+#### Alternative engine: ElevenLabs
+
+ElevenLabs is a cloud TTS engine that plugs into the same `say`
+pipeline (the MP3 reply is decoded to 16 kHz mono PCM, then encoded to
+Opus). Unlike VOICEVOX/Irodori there is nothing to self-host — you need
+an [ElevenLabs](https://elevenlabs.io/) account and API key, and each
+`say` call bills your ElevenLabs quota.
+
+Install the extra:
+
+```bash
+pip install 'stackchan-mcp[tts-elevenlabs]'
+```
+
+Configure via environment variables (the key is read from the
+environment only — never commit it):
+
+| Environment variable | Default | Notes |
+|---|---|---|
+| `ELEVENLABS_API_KEY` | _(required)_ | Your ElevenLabs API key. `STACKCHAN_ELEVENLABS_KEY` is also accepted and wins when both are set. |
+| `STACKCHAN_ELEVEN_VOICE_<NAME>` | _(none)_ | Voice map: each variable names one speaker, e.g. `STACKCHAN_ELEVEN_VOICE_RACHEL=<voice id>` makes `speaker_name="rachel"` work. |
+| `STACKCHAN_ELEVEN_DEFAULT_SPEAKER` | _(none)_ | Speaker used when a call omits `speaker_name`. If unset and exactly one voice is mapped, that voice is the default. |
+| `STACKCHAN_ELEVEN_MODEL` | `eleven_v3` | ElevenLabs model identifier. |
+
+Select ElevenLabs per call — the speaker selector is the string
+`speaker_name` (not the numeric `speaker_id`, which is VOICEVOX-shaped);
+a raw ElevenLabs voice ID is also accepted and passed through verbatim:
+
+```
+say(text="Hello!", voice="elevenlabs", speaker_name="rachel")
+```
+
+Or make it the default engine:
+
+```bash
+export STACKCHAN_TTS_ENGINE=elevenlabs
+```
+
+#### Alternative engine: Fish Audio
+
+[Fish Audio](https://fish.audio) is a hosted TTS service with strong
+English voices and user-trainable voice models, which makes it a
+practical alternative to VOICEVOX (Japanese-only by default) for English
+deployments.
+
+It is a **third-party cloud service**: the text passed to `say` leaves
+this machine and is sent to Fish Audio's servers to be synthesised.
+Review [Fish Audio's terms and pricing](https://fish.audio) before
+sending anything you would not want to share with them, and prefer a
+local engine such as VOICEVOX for sensitive utterances.
+
+Unlike Irodori, this engine needs **no audio decoder**: the Fish Audio
+API returns 16-bit mono PCM/WAV at a caller-chosen sample rate, and the
+engine asks for 16 kHz — exactly what the device's Opus decoder expects.
+So there is no `miniaudio` (Irodori) and no `ffmpeg` (Edge TTS)
+dependency, and the extra is a convenience alias over `[tts]`:
+
+```bash
+pip install 'stackchan-mcp[tts-fish-audio]'
+```
+
+The `mp3` and `opus` response formats are deliberately unsupported —
+consuming them would pull in a decoder purely to undo an encode we never
+needed.
+
+Carrying no decoder also means nothing downstream would notice a reply
+that is not audio, so the engine checks that itself: a `200` whose
+content type is missing or not audio, or whose body is not the format that was
+requested, is rejected rather than played, and a response shorter than
+its own WAV header promises — or a `pcm` body that is not a whole number
+of samples — is reported as truncated instead of quietly returning a
+clipped utterance.
+
+Configure via environment variables (the API key is read from the
+environment only — never commit it):
+
+| Environment variable | Default | Notes |
+|---|---|---|
+| `STACKCHAN_FISH_AUDIO_KEY` | _(required)_ | API key, sent as `Authorization: Bearer <key>`. Unset → the engine still lists but `say(voice="fish-audio")` returns a clear error. |
+| `STACKCHAN_FISH_AUDIO_MODEL` | _(none)_ | Default voice model ID (the API's `reference_id`). When unset the request omits it and Fish Audio uses its own default voice. |
+| `STACKCHAN_FISH_AUDIO_BACKEND` | `s2.1-pro` | Synthesis backend, sent as the `model` header. One of `s1`, `s2-pro`, `s2.1-pro`, `s2.1-pro-free`. |
+| `STACKCHAN_FISH_AUDIO_URL` | `https://api.fish.audio/v1/tts` | Endpoint override, for a proxy or a compatible self-hosted deployment. |
+
+Select Fish Audio per call:
+
+```
+say(text="Nice to meet you!", voice="fish-audio")
+```
+
+Or make it the default engine for every `say` call that omits `voice`:
+
+```bash
+export STACKCHAN_TTS_ENGINE=fish-audio
+```
+
+A per-call `speaker_name` overrides `STACKCHAN_FISH_AUDIO_MODEL`, so a
+single deployment can switch between trained voices without restarting
+the gateway.
+
 ### 5. Optional: STT setup (faster-whisper)
 
 To let the device hear, install one of the `[stt-*]` extras and pair
@@ -671,6 +805,7 @@ prerequisite as the `[tts]` extra).
 
 | Environment variable | Default | Notes |
 |---|---|---|
+| `STACKCHAN_LISTEN_LANGUAGE` | `ja` | Default `listen()` language when the tool call omits `language`. |
 | `STACKCHAN_FASTER_WHISPER_MODEL` | `base` | Model identifier — `tiny` / `base` / `small` / `medium` / `large-v3`. Larger models are more accurate but slower and use more memory. |
 | `STACKCHAN_FASTER_WHISPER_DEVICE` | `cpu` | `cpu` / `cuda` / `auto`. |
 | `STACKCHAN_FASTER_WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `float16` / `float32`. |
@@ -1010,7 +1145,7 @@ See [#80](https://github.com/kisaragi-mochi/stackchan-mcp/issues/80) for the low
 ## Known issues
 
 - The servo bus may hang on large-angle abrupt reversals (e.g. +60° → -60°). A fix is in progress via Motion::update_task interpolation.
-- The touch sensor (Si12T) occasionally drops tap events. Sensitivity register tuning has room to improve here.
+- Head-touch (Si12T) is off by default. TAP is a short press and STROKE is a finger sliding across the three head zones; a hand resting on the head does nothing. Check `get_touch_state` (`recalibrations`, `masked`) if it ever misbehaves.
 
 ## License
 

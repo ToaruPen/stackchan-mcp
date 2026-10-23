@@ -48,15 +48,17 @@
 |---|---|---|
 | `get_status` | ゲートウェイ接続状態 | ✅ |
 | `get_device_info` | ESP32 デバイス状態 (バッテリー/音量/WiFi 等) | ✅ |
-| `take_photo(question?)` | カメラ撮影 → JPEG 保存 → パス返す | ✅ |
+| `take_photo(question?)` | カメラ撮影 → JPEG 保存 → パス + インライン画像ブロック返す | ✅ |
 | `camera_stream(action, fps?, quality?)` | 最新JPEG 1枚だけをメモリに保持するstreamを参照数管理（`start` / `stop` / `status`）。画像はディスクへ保存しない | ✅ |
 | `stackchan_face_follow(action)` | gateway所有の人物追従を開始・状態取得・停止（`start` / `status` / `stop`）。camera frame、PINTO推論、controller、latest-only head laneはすべて `stackchan-mcp` 内に置き、MCP hostへ組み込まない。`[face-follow]` extraと `STACKCHAN_FACE_FOLLOW_MODEL` が必要 | ✅ |
 | `set_volume(volume)` | スピーカー音量 (0-100) | ✅ |
 | `set_brightness(brightness)` | 画面明るさ (0-100) | ✅ |
+| `set_off_timeout(seconds)` | 画面消灯までの無操作時間を保存 (0..86400 秒、既定 300、0 で無効化)。firmware 1.17.0 以降が必要 | ✅ |
+| `get_off_timeout` | 保存された消灯時間と現在の画面状態を取得。firmware 1.17.0 以降が必要 | ✅ |
 | `move_head(yaw, pitch, speed?)` | 首を動かす (サーボ)。`pitch` は M5Stack 推奨運用レンジ `5..85` に制限される。ファームウェア側のハードクランプ (`0..88`) を使いたい場合は、firmware-side の `set_head_angles` デバイスツールを利用する | ✅ |
 | `get_touch_state` | タッチセンサ状態 (press/release/stroke 等) | ✅ |
 | `get_touch_sensor_enabled` | 頭部タッチ検出が有効かどうかを取得。NVS に保存され、再起動後も維持される | ✅ |
-| `set_touch_sensor_enabled(enabled)` | 頭部タッチ検出を有効/無効化。無効時は firmware 側のローカル動作反応と MCP `stackchan/event` 送信の両方を止め、設定は再起動後も維持される | ✅ |
+| `set_touch_sensor_enabled(enabled)` | 頭部タッチ検出を有効/無効化。無効時は firmware 側のローカル動作反応と MCP `stackchan/event` 送信の両方を止め、設定は再起動後も維持される。**未設定のときは無効**（有効にするまで反応しない） | ✅ |
 | `set_avatar(face)` | アバター表情切替 (`idle` / `happy` / `thinking` / `sad` / `surprised` / `embarrassed`)、または `off` でアバターを隠し blink も停止して下層の WiFi 設定 / OTA / 設定画面を露出。他 face を指定するとアバター + blink が復帰 | ✅ |
 | `set_blink(state)` | 瞬き ON/OFF | ✅ |
 | `set_mouth(state)` | 口開閉（one-shot、次の呼び出しまで保持） | ✅ |
@@ -74,6 +76,7 @@
 | `beat_meta_snapshot()` | beat mode の最新メタデータを polling で取得する。active 状態、BPM、confidence、現在の sensitivity / minimum onset floor、最終 beat/audio timestamp、capture health、counter、現在の motion/LED パラメータを返す | ✅ |
 | `beat_clip_save(seconds?)` | 最新の rolling beat-mode 音声を 16 kHz mono WAV の一時ファイルとして保存し、パスと実際に保存できた秒数を返す。clip ファイルはディスクに残るため、不要になったら caller 側で削除してください | ✅ |
 | `stackchan_follow_pose_stream(action, url, ...)` | 任意の外部 WebSocket pose-stream を購読し、 受信した `yaw` / `pitch` フレームに対して 1:1 で首を追従させる（SCS0009 動作範囲内、 yaw ±90°、 pitch 5..85°）。 `action` は `start` / `stop` / `status` を切替。 軸反転、 pitch センター offset、 ダウンサンプル、 角速度クランプ、 exponential backoff 付き reconnect を内包し、 初期姿勢はデバイス側から seed することで初回フレームから角速度クランプが実サーボ位置を基準に効きます。 上流サーバ側のプロトコル（zero-offset コマンド、 ソース選択、 トランスポート）は本 gateway のスコープ外。 | ✅ |
+| `upgrade_firmware(firmware_path, timeout?)` | 手元の `xiaozhi.bin` を USB ケーブルなしで Wi-Fi 越しに書き込む。ESP32-S3 用の `xiaozhi` イメージで、このボード向け、SHA-256 が正しく、OTA 領域に収まるものでなければ、機体に送る前に gateway が断る。通れば推測できない短命の URL で1回だけ配り、再起動を待って動いているイメージを確かめる。[Wi-Fi 越しの更新](#wi-fi-越しの更新-usb-なし) を参照 | ✅ |
 | `stackchan_follow_led_stream(action, url, target, ...)` | 任意の外部 WebSocket LED-frame stream を購読し、検証済みの `colors` フレームをベース部 12 LED または Port B WS2812 strip に転送する。`event` フレームは rate gate を bypass し、`continuous` フレームは `max_fps` で制限される | ✅ |
 
 詳細スキーマは `gateway/README.md` 参照。
@@ -104,6 +107,20 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 -b 460800 \
 ```
 
 ESP-IDF や Docker のセットアップは不要。
+
+#### Wi-Fi 越しの更新 (USB なし)
+
+機体が gateway につながっていれば、2回目以降の更新はケーブルなしでできます。gateway のツール `upgrade_firmware` に、gateway を動かしているマシン上のアプリイメージ（Release の `xiaozhi.bin` か `build/xiaozhi.bin`。`merged-binary.bin` は不可）のパスを渡します。
+
+```text
+upgrade_firmware({"firmware_path": "~/Downloads/xiaozhi.bin"})
+```
+
+gateway はまずファイルを確かめ（ESP32-S3 のアプリイメージ、プロジェクト名 `xiaozhi`、このボードの名前、末尾の SHA-256、OTA 領域 0x3F0000 に収まる）、合わなければ機体には何も送らずに断ります。通れば capture ポート（`CAPTURE_PORT`、既定 8766）で、120 秒で切れる推測できない URL から1回だけ配ります。機体が gateway の WebSocket に使っているアドレスでこのポートに届く必要があります。ツールはダウンロード（約25秒）・再起動・再接続を待ち、`before` / `after`（版、コンパイル時刻、ELF SHA-256、OTA パーティション）を返します。全体で1分ほどです。
+
+機体は使っていない側の OTA 領域に書き、ESP-IDF がイメージを検証してから切り替えます。アプリのロールバックが有効なので、新しいイメージが OTA の版確認まで届く前に再起動した場合は、次のリセットで前のイメージに戻ります。再起動後に機体が別の gateway につながった場合（mDNS の順番）は `no_reconnect` が返ります。その gateway 側を見てください。
+
+OTA の後は機体が `ota_1`（0x410000）で動いていることがあります。そのときは USB で `0x20000` にアプリだけ書いても切り替わりません。`write_flash 0x20000 xiaozhi.bin` の前に `erase_region 0xd000 0x2000`（OTA data の消去。NVS と Wi-Fi 設定は残る）を入れてください。
 
 #### オプション B: ソースから Docker でビルド（コントリビュータ向け）
 
@@ -569,6 +586,98 @@ export STACKCHAN_TTS_ENGINE=irodori
 `STACKCHAN_TTS_ENGINE` 未設定なら VOICEVOX がデフォルトのままで、
 明示的な `voice` 引数は常にデフォルトを上書きします。
 
+#### 別エンジン: ElevenLabs
+
+ElevenLabs はクラウド TTS エンジンで、同じ `say` パイプラインに
+差し込めます（MP3 応答を 16 kHz モノラル PCM にデコードし、Opus に
+エンコード）。VOICEVOX/Irodori と違い自前ホストは不要 —
+[ElevenLabs](https://elevenlabs.io/) のアカウントと API キーが必要で、
+`say` のたびに ElevenLabs のクォータを消費します。
+
+extra をインストール:
+
+```bash
+pip install 'stackchan-mcp[tts-elevenlabs]'
+```
+
+環境変数で設定（キーは環境変数からのみ読み取り — コミット厳禁）:
+
+| 環境変数 | デフォルト | 備考 |
+|---|---|---|
+| `ELEVENLABS_API_KEY` | _(必須)_ | ElevenLabs の API キー。`STACKCHAN_ELEVENLABS_KEY` も受け付け、両方あれば後者が優先 |
+| `STACKCHAN_ELEVEN_VOICE_<NAME>` | _(なし)_ | ボイス表: 変数 1 つが話者 1 人。例 `STACKCHAN_ELEVEN_VOICE_RACHEL=<voice id>` で `speaker_name="rachel"` が使える |
+| `STACKCHAN_ELEVEN_DEFAULT_SPEAKER` | _(なし)_ | `speaker_name` 省略時の話者。未設定でボイスが 1 つだけならそれがデフォルト |
+| `STACKCHAN_ELEVEN_MODEL` | `eleven_v3` | ElevenLabs のモデル ID |
+
+呼び出しごとに ElevenLabs を選択 — 話者の指定は文字列の
+`speaker_name`（数値の `speaker_id` は VOICEVOX 形）。生の
+ElevenLabs voice ID もそのまま通ります:
+
+```
+say(text="Hello!", voice="elevenlabs", speaker_name="rachel")
+```
+
+またはデフォルトエンジンに:
+
+```bash
+export STACKCHAN_TTS_ENGINE=elevenlabs
+```
+
+#### 別エンジン: Fish Audio
+
+[Fish Audio](https://fish.audio) はホスト型の TTS サービスで、英語の
+声が強く、自分で学習させたボイスモデルも使えます。VOICEVOX（既定では
+日本語のみ）の代わりに、英語で使いたい場合の選択肢になります。
+
+これは **サードパーティのクラウドサービス** です。`say` に渡した
+テキストはこのマシンの外に出て、Fish Audio のサーバーで合成されます。
+共有したくない内容を送る前に
+[Fish Audio の利用規約と料金](https://fish.audio) を確認し、機密性の
+高い発話には VOICEVOX などのローカルエンジンを使ってください。
+
+Irodori と違い、このエンジンは **音声デコーダーが不要** です。Fish Audio
+API は呼び出し側が指定したサンプルレートで 16-bit モノラルの PCM/WAV を
+返し、エンジンはデバイスの Opus デコーダーが期待する 16 kHz を指定
+します。そのため `miniaudio`（Irodori）も `ffmpeg`（Edge TTS）も
+不要で、extra は `[tts]` への便宜的なエイリアスです:
+
+```bash
+pip install 'stackchan-mcp[tts-fish-audio]'
+```
+
+`mp3` と `opus` の応答形式は意図的に非対応です（使うと、不要になった
+エンコードを元に戻すためだけにデコーダーが必要になります）。
+
+デコーダーが無いため、音声ではない応答があっても後段では気づけません。
+そこでエンジン自身が確認します。`200` でも Content-Type が無い・空・
+音声ではない場合や、本文が要求した形式でない場合は再生せずに拒否します。
+WAV ヘッダーが宣言するより短い応答や、サンプル数が整数にならない `pcm`
+本文も、短く切れた発話を成功扱いにせず「途中で切れた」と報告します。
+
+環境変数で設定（API キーは環境変数からのみ読み取り — コミット厳禁）:
+
+| 環境変数 | デフォルト | 備考 |
+|---|---|---|
+| `STACKCHAN_FISH_AUDIO_KEY` | _(必須)_ | API キー。`Authorization: Bearer <key>` で送信。未設定でもエンジンは一覧に出ますが、`say(voice="fish-audio")` は分かりやすいエラーを返します |
+| `STACKCHAN_FISH_AUDIO_MODEL` | _(なし)_ | 既定のボイスモデル ID（API の `reference_id`）。未設定ならリクエストに含めず、Fish Audio 側の既定の声になります |
+| `STACKCHAN_FISH_AUDIO_BACKEND` | `s2.1-pro` | 合成バックエンド（`model` ヘッダーで送信）。`s1`・`s2-pro`・`s2.1-pro`・`s2.1-pro-free` のいずれか |
+| `STACKCHAN_FISH_AUDIO_URL` | `https://api.fish.audio/v1/tts` | エンドポイントの上書き（プロキシや互換のセルフホスト用） |
+
+呼び出しごとに Fish Audio を選択:
+
+```
+say(text="Nice to meet you!", voice="fish-audio")
+```
+
+`voice` を省略した `say` 全部の既定エンジンにする場合:
+
+```bash
+export STACKCHAN_TTS_ENGINE=fish-audio
+```
+
+呼び出しごとの `speaker_name` は `STACKCHAN_FISH_AUDIO_MODEL` を上書き
+するので、gateway を再起動せずに学習済みボイスを切り替えられます。
+
 ### 5. オプション: STT セットアップ (faster-whisper)
 
 デバイスに聞いてもらうには、`[stt-*]` extras のどれかをインストール
@@ -605,6 +714,7 @@ export OPENAI_API_KEY=sk-...
 
 | 環境変数 | デフォルト | 補足 |
 |---|---|---|
+| `STACKCHAN_LISTEN_LANGUAGE` | `ja` | `listen()` が `language` を省略したときのデフォルト言語 |
 | `STACKCHAN_FASTER_WHISPER_MODEL` | `base` | モデル識別子 — `tiny` / `base` / `small` / `medium` / `large-v3`。大きいモデルほど精度は上がるが、メモリ消費と推論時間も増える |
 | `STACKCHAN_FASTER_WHISPER_DEVICE` | `cpu` | `cpu` / `cuda` / `auto` |
 | `STACKCHAN_FASTER_WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `float16` / `float32` |
@@ -915,7 +1025,7 @@ python scripts/avatar_convert/convert_avatars.py
 ## 既知の課題
 
 - 大角度急逆転 (±60° → -60° 等) でサーボハングする場合あり (Motion::update_task の補間移植で改善予定)
-- タッチセンサ (Si12T) のぽん判定取りこぼし (感度レジスタ調整余地)
+- 頭タッチ (Si12T) は既定で無効。タップ＝短く触れる、なで＝指が頭の 3 つのゾーンをまたいで動く。手を置いたままでは反応しない。おかしいときは `get_touch_state` の `recalibrations` / `masked` を見る
 
 ## ハードウェア安全上の注意
 

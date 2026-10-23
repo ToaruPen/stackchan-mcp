@@ -8,6 +8,8 @@
 #include "axp2101.h"
 #include "mcp_server.h"
 #include "settings.h"
+#include "touch_gesture.h"
+#include "power_save_gate.h"
 #include "led_strip.h"
 // Issue #79: servo driver is selectable at build time via Kconfig.
 //   - CONFIG_STACKCHAN_SERVO_SCSCL  (default): GPL-3.0 SCServo_lib
@@ -43,6 +45,7 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <driver/uart.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_commands.h>
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
 #include <esp_random.h>
@@ -58,16 +61,76 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #define TAG "StackChanBoard"
 
+#ifndef STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS
+#define STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS 300
+#endif
+
+#define STACKCHAN_SCREEN_OFF_MAX_TIMEOUT_SECONDS 86400
+#if STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS < 0 || \
+    STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS > STACKCHAN_SCREEN_OFF_MAX_TIMEOUT_SECONDS
+#error "STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS must be in 0..86400"
+#endif
+#define STACKCHAN_LCD_SLEEP_TRANSITION_MS 120
+#define STACKCHAN_SCREEN_OFF_NVS_NAMESPACE "display"
+#define STACKCHAN_SCREEN_OFF_NVS_KEY "off_timeout"
+
+// Charge-control boot default (AXP2101 reg 0x18 bit1, see class Pmic below).
+// Keep the AXP2101 reset default and the pre-feature firmware behaviour unless
+// a build explicitly overrides it.
+#ifndef STACKCHAN_DEFAULT_CHARGE_ENABLED
+#define STACKCHAN_DEFAULT_CHARGE_ENABLED 1
+#endif
+
+// Automatic charge hysteresis. These values may be overridden with compiler
+// -D options. The existing one-second status-bar battery poll drives the
+// decision at a 60-second cadence; no dedicated timer or task is created.
+#ifndef STACKCHAN_CHARGE_AUTO
+#define STACKCHAN_CHARGE_AUTO 0
+#endif
+
+#ifndef STACKCHAN_CHARGE_ON_BELOW
+#define STACKCHAN_CHARGE_ON_BELOW 30
+#endif
+
+#ifndef STACKCHAN_CHARGE_OFF_ABOVE
+#define STACKCHAN_CHARGE_OFF_ABOVE 70
+#endif
+
+#if STACKCHAN_CHARGE_ON_BELOW < 0 || STACKCHAN_CHARGE_ON_BELOW > 100
+#error "STACKCHAN_CHARGE_ON_BELOW must be between 0 and 100"
+#endif
+
+#if STACKCHAN_CHARGE_OFF_ABOVE < 0 || STACKCHAN_CHARGE_OFF_ABOVE > 100
+#error "STACKCHAN_CHARGE_OFF_ABOVE must be between 0 and 100"
+#endif
+
+#if STACKCHAN_CHARGE_ON_BELOW >= STACKCHAN_CHARGE_OFF_ABOVE
+#error "STACKCHAN_CHARGE_ON_BELOW must be lower than STACKCHAN_CHARGE_OFF_ABOVE"
+#endif
+
+// ESP-IDF NVS namespace and key names are limited to 15 characters (16
+// including the terminating NUL). The public/API name stays
+// charge_protection; only its physical NVS key is shortened.
+#define STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE "stackchan"
+#define STACKCHAN_CHARGE_PROTECTION_NVS_KEY "chg_protect"
+#define STACKCHAN_CHARGE_ON_BELOW_NVS_KEY "chg_on_below"
+#define STACKCHAN_CHARGE_OFF_ABOVE_NVS_KEY "chg_off_above"
+// Public name external_power_auto_off; same namespace as charge_protection.
+#define STACKCHAN_EXTERNAL_POWER_AUTO_OFF_NVS_KEY "ext_auto_off"
+
 class Pmic : public Axp2101 {
 public:
     // Power Init
-    Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
+    Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr,
+         bool charge_protection_enabled)
+        : Axp2101(i2c_bus, addr) {
         uint8_t data = ReadReg(0x90);
         data |= 0b10110100;
         WriteReg(0x90, data);
@@ -78,6 +141,61 @@ public:
         WriteReg(0x90, 0xBF);
         WriteReg(0x94, 33 - 5);
         WriteReg(0x95, 33 - 5);
+
+        // Apply the charge-control boot default last, after every other
+        // Power Init write above. This preserves the established PMIC
+        // initialization order and changes charging only after all other
+        // controls are configured.
+        SetChargeEnabled(
+            charge_protection_enabled
+                ? (STACKCHAN_DEFAULT_CHARGE_ENABLED != 0)
+                : true);
+    }
+
+    // AXP2101 reg 0x18 bit1 = Cell Battery charge enable (datasheet
+    // §6.13.2.14: 0=disable, 1=enable, System Reset default=1).
+    // Read-Modify-Write only bit1; bit3 (Gauge Module enable), bit2
+    // (Button Battery charge enable), and bit0 (Watchdog Module enable)
+    // must survive untouched.
+    void SetChargeEnabled(bool enable) {
+        uint8_t value = ReadReg(0x18);
+        if (enable) {
+            value |= 0b00000010;
+        } else {
+            value &= static_cast<uint8_t>(~0b00000010);
+        }
+        WriteReg(0x18, value);
+    }
+
+    bool IsChargeEnabled() {
+        return (ReadReg(0x18) & 0b00000010) != 0;
+    }
+
+    uint8_t GetChargeControlRegister() {
+        return ReadReg(0x18);
+    }
+
+    // Read the same AXP2101 fuel-gauge register used by
+    // Axp2101::GetBatteryLevel(), but return a failure instead of aborting the
+    // firmware on an I2C error. Values outside the percentage range are also
+    // treated as unavailable so automatic control can fail safe to charging.
+    bool TryGetBatteryLevel(int* level) {
+        uint8_t reg = 0xA4;
+        uint8_t value = 0;
+        esp_err_t err =
+            i2c_master_transmit_receive(i2c_device_, &reg, 1, &value, 1, 100);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Battery level read failed: %s",
+                     esp_err_to_name(err));
+            return false;
+        }
+        if (value > 100) {
+            ESP_LOGW(TAG, "Battery level is invalid: %u",
+                     static_cast<unsigned>(value));
+            return false;
+        }
+        *level = value;
+        return true;
     }
 
     void SetBrightness(uint8_t brightness) {
@@ -89,6 +207,17 @@ public:
 class CustomBacklight : public Backlight {
 public:
     CustomBacklight(Pmic *pmic) : pmic_(pmic) {}
+
+    void SetBrightnessImmediate(uint8_t brightness) {
+        if (brightness > 100) {
+            brightness = 100;
+        }
+        if (transition_timer_ != nullptr) {
+            esp_timer_stop(transition_timer_);
+        }
+        target_brightness_ = brightness;
+        SetBrightnessImpl(brightness);
+    }
 
     void SetBrightnessImpl(uint8_t brightness) override {
         pmic_->SetBrightness(target_brightness_);
@@ -411,27 +540,37 @@ private:
 };
 
 // Minimal Si12T driver (12-channel capacitive touch sensor, TSM12-compatible).
-// Used for the StackChan head-stroke / head-tap detection. Only the read path
-// (Output1 register, channels 1-4) is needed for Phase 7. We expose just the
-// first three channels through ReadTouchState() because the StackChan head
-// has 3 conductive zones wired to TS1..TS3.
+// Used for the StackChan head-stroke / head-tap detection. The head has 3
+// conductive zones wired to TS1..TS3 (front / middle / back); ReadTouchState()
+// exposes CH1..CH3 from Output1.
 //
-// Datasheet excerpt:
+// Datasheet notes (Si12T datasheet Rev 0.1 sec.12, TSM12 datasheet sec.8-9):
 //   - I2C 7-bit address: 0xD0 >> 1 == 0x68 when ID_SEL pin is tied to GND.
-//     This matches the address probed at boot ("0x68").
-//   - Reset value of CTRL (0x09) is 0b00000111 (SLEEP=1). We must clear SLEEP
-//     to enter normal sensing mode: CTRL = 0b00000011.
-//   - Output1 (0x10) packs four channels into one byte (2 bits per channel):
-//       bit[1:0] = OUT1, bit[3:2] = OUT2, bit[5:4] = OUT3, bit[7:6] = OUT4
+//   - CTRL (0x09): bit3 = SRST (soft reset), bit2 = SLEEP, bit1:0 must be 11.
+//     Power-on value 0x07 (asleep). 0x0F resets the digital part, 0x03 runs.
+//   - SEN1..SEN6 (0x02..0x07): two channels per byte, low nibble = lower
+//     channel. M[2:0] = detection threshold (011 = 1.20 %).
+//   - Ref_rst1/2 (0x0A/0x0B): while a bit is 1 the channel baseline is
+//     re-captured. Power-on 0xFE / 0x0F (channels 2.. held in reset).
+//   - Ch_on1/2 (0x0C/0x0D): a bit set to 1 STOPS that channel. Power-on
+//     0xFE / 0x3F. Bit 4 and 5 of 0x0D must stay 1.
+//   - Cal_on1/2 (0x0E/0x0F): a bit set to 1 freezes baseline tracking.
+//   - Output1 (0x10) packs four channels, 2 bits each:
+//       bit[1:0] = CH1, bit[3:2] = CH2, bit[5:4] = CH3, bit[7:6] = CH4
 //       00 = no output, 01 = low, 10 = medium, 11 = high.
-//   - There is no dedicated chip-id register, so Begin() validates the device
-//     via successful I2C ACK on the CTRL read + non-0xFF Output1 read.
+//   - FTC (CFIG 0x08 = 0x22): after power-up / reset the chip calibrates fast
+//     for 10 s, so Output1 is not trustworthy during that window.
+// Begin() follows the datasheet start-up order (soft reset -> sensitivity ->
+// channel enable -> release baseline reset -> run) every boot, because the chip
+// keeps whatever the previous firmware (or a stuck baseline) left behind
+// across an ESP32 reset.
 class Si12T : public I2cDevice {
 public:
     static constexpr uint8_t DEFAULT_ADDR = 0x68;  // ID_SEL = GND
 
     struct TouchState {
         bool zone[3];          // CH1, CH2, CH3 — true if any output level set
+        uint8_t level[3];      // CH1..CH3 output level 0..3
         uint8_t output1_raw;   // raw Output1 register byte (0x10)
         bool ok;               // false if the I2C read failed
     };
@@ -439,50 +578,132 @@ public:
     Si12T(i2c_master_bus_handle_t i2c_bus, uint8_t addr = DEFAULT_ADDR)
         : I2cDevice(i2c_bus, addr) {}
 
-    // Probe the chip and bring it out of sleep. Returns true on success.
+    // Soft-reset and configure the chip. Returns false if any write fails or
+    // a register does not read back as written.
     bool Begin() {
-        uint8_t ctrl = 0;
-        if (!SafeReadReg(REG_CTRL, &ctrl)) {
+        uint8_t before[REG_COUNT] = {};
+        uint8_t ctrl_before = 0;
+        if (!SafeReadReg(REG_CTRL, &ctrl_before)) {
             return false;
         }
-        // CTRL bit1 = SLEEP. Clear it; bit1:0 must hold 1 per datasheet
-        // ("CTRL Bit1, Bit0 = 1 1" reset value), so write 0b00000011.
-        if (!SafeWriteReg(REG_CTRL, 0x03)) {
-            return false;
+        for (uint8_t i = 0; i < REG_COUNT; i++) {
+            SafeReadReg(static_cast<uint8_t>(REG_SEN1 + i), &before[i]);
         }
-        // Verify the device actually responds on the output register.
-        // 0xFF would indicate an open bus / no device.
+
+        // 1. Soft reset, then back to the (asleep) power-on mode.
+        if (!SafeWriteReg(REG_CTRL, 0x0F)) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (!SafeWriteReg(REG_CTRL, 0x07)) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // 2. Sensitivity (CH1..CH4: M=011 / 1.20 %, HL=0 — same as the
+        //    reference M5 firmware), fast-calibration config, and enable the
+        //    three head channels only (CH4..CH12 stay stopped).
+        const struct { uint8_t reg; uint8_t val; } cfg[] = {
+            {REG_SEN1,    0x33},
+            {REG_SEN2,    0x33},
+            {REG_CFIG,    0x22},
+            {REG_CH_ON1,  0xF8},
+            {REG_CH_ON2,  0x3F},
+            {REG_REF_RST1, 0x00},
+            {REG_REF_RST2, 0x00},
+            {REG_CAL_ON1, 0x00},
+            {REG_CAL_ON2, 0x00},
+        };
+        for (const auto& c : cfg) {
+            if (!SafeWriteReg(c.reg, c.val)) return false;
+        }
+
+        // 3. Leave sleep.
+        if (!SafeWriteReg(REG_CTRL, 0x03)) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // 4. Read everything back; refuse to run on a chip that did not take
+        //    the configuration.
+        uint8_t after[REG_COUNT] = {};
+        uint8_t ctrl_after = 0;
+        if (!SafeReadReg(REG_CTRL, &ctrl_after)) return false;
+        for (uint8_t i = 0; i < REG_COUNT; i++) {
+            if (!SafeReadReg(static_cast<uint8_t>(REG_SEN1 + i), &after[i])) return false;
+        }
+        bool verified = (ctrl_after & 0x0C) == 0;  // SRST and SLEEP cleared
+        for (const auto& c : cfg) {
+            if (after[c.reg - REG_SEN1] != c.val) verified = false;
+        }
         uint8_t out1 = 0;
-        if (!SafeReadReg(REG_OUTPUT1, &out1)) {
-            return false;
-        }
+        if (!SafeReadReg(REG_OUTPUT1, &out1)) return false;
+
+        ESP_LOGI("Si12T",
+                 "before: ctrl=0x%02X sen=%02X%02X cfig=%02X ref=%02X%02X on=%02X%02X cal=%02X%02X",
+                 ctrl_before, before[0], before[1], before[REG_CFIG - REG_SEN1],
+                 before[REG_REF_RST1 - REG_SEN1], before[REG_REF_RST2 - REG_SEN1],
+                 before[REG_CH_ON1 - REG_SEN1], before[REG_CH_ON2 - REG_SEN1],
+                 before[REG_CAL_ON1 - REG_SEN1], before[REG_CAL_ON2 - REG_SEN1]);
+        ESP_LOGI("Si12T",
+                 "after:  ctrl=0x%02X sen=%02X%02X cfig=%02X ref=%02X%02X on=%02X%02X cal=%02X%02X out1=0x%02X",
+                 ctrl_after, after[0], after[1], after[REG_CFIG - REG_SEN1],
+                 after[REG_REF_RST1 - REG_SEN1], after[REG_REF_RST2 - REG_SEN1],
+                 after[REG_CH_ON1 - REG_SEN1], after[REG_CH_ON2 - REG_SEN1],
+                 after[REG_CAL_ON1 - REG_SEN1], after[REG_CAL_ON2 - REG_SEN1], out1);
         if (out1 == 0xFF) {
             ESP_LOGW("Si12T", "Output1 read 0xFF (likely no device)");
             return false;
         }
-        ESP_LOGI("Si12T", "init OK: ctrl=0x%02X out1=0x%02X (sleep cleared)", ctrl, out1);
+        if (!verified) {
+            ESP_LOGW("Si12T", "register read-back mismatch after init");
+            return false;
+        }
+        ESP_LOGI("Si12T", "init OK (soft reset, CH1-3 enabled, baseline reset released)");
+        return true;
+    }
+
+    // Re-capture the baseline of the channels in `mask` (bit0 = CH1). The
+    // reset bits are released on the next ReadTouchState().
+    bool ResetReference(uint8_t mask) {
+        mask &= 0x07;
+        if (mask == 0) return true;
+        if (!SafeWriteReg(REG_REF_RST1, mask)) return false;
+        ref_reset_pending_ = true;
         return true;
     }
 
     // Sample channels CH1..CH3 from Output1 (0x10). Single-shot read; the
-    // caller is expected to debounce / interpret duration externally.
+    // caller interprets the gesture.
     TouchState ReadTouchState() {
         TouchState s = {};
         s.ok = false;
+        if (ref_reset_pending_) {
+            if (!SafeWriteReg(REG_REF_RST1, 0x00)) {
+                return s;
+            }
+            ref_reset_pending_ = false;
+        }
         if (!SafeReadReg(REG_OUTPUT1, &s.output1_raw)) {
             return s;
         }
         s.ok = true;
-        // Each channel uses 2 bits; nonzero = touched at some level.
-        s.zone[0] = ((s.output1_raw >> 0) & 0x3) != 0;  // CH1
-        s.zone[1] = ((s.output1_raw >> 2) & 0x3) != 0;  // CH2
-        s.zone[2] = ((s.output1_raw >> 4) & 0x3) != 0;  // CH3
+        for (int i = 0; i < 3; i++) {
+            s.level[i] = (s.output1_raw >> (i * 2)) & 0x3;
+            s.zone[i] = s.level[i] != 0;
+        }
         return s;
     }
 
 private:
-    static constexpr uint8_t REG_CTRL    = 0x09;  // CTRL, SLEEP bit etc.
-    static constexpr uint8_t REG_OUTPUT1 = 0x10;  // CH1..CH4 packed (2bpp)
+    static constexpr uint8_t REG_SEN1     = 0x02;
+    static constexpr uint8_t REG_SEN2     = 0x03;
+    static constexpr uint8_t REG_CFIG     = 0x08;
+    static constexpr uint8_t REG_CTRL     = 0x09;
+    static constexpr uint8_t REG_REF_RST1 = 0x0A;
+    static constexpr uint8_t REG_REF_RST2 = 0x0B;
+    static constexpr uint8_t REG_CH_ON1   = 0x0C;
+    static constexpr uint8_t REG_CH_ON2   = 0x0D;
+    static constexpr uint8_t REG_CAL_ON1  = 0x0E;
+    static constexpr uint8_t REG_CAL_ON2  = 0x0F;
+    static constexpr uint8_t REG_OUTPUT1  = 0x10;  // CH1..CH4 packed (2bpp)
+    static constexpr uint8_t REG_COUNT    = 14;    // 0x02..0x0F
+
+    bool ref_reset_pending_ = false;
 
     bool SafeReadReg(uint8_t reg, uint8_t* out) {
         esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, out, 1, 100);
@@ -531,12 +752,50 @@ private:
     static constexpr gpio_num_t PORT_C_WS2812_DATA_PIN = GPIO_NUM_17;  // CoreS3 HY2.0-4P (Port C) signal 1
     static constexpr uint16_t PORT_C_WS2812_MAX_LEDS = 256;
     Pmic* pmic_;
+    enum class ChargeAutoDecision : uint8_t {
+        kNotRun = 0,
+        kEnabledLowBattery,
+        kDisabledHighBattery,
+        kKeptBetweenThresholds,
+        kEnabledBatteryReadFailed,
+        kProtectionDisabled,
+        kAutoDisabled,
+    };
+    static constexpr uint32_t CHARGE_AUTO_INTERVAL_MS = 60 * 1000;
+    std::atomic<bool> charge_protection_{STACKCHAN_CHARGE_AUTO != 0};
+    std::atomic<int> charge_on_below_{STACKCHAN_CHARGE_ON_BELOW};
+    std::atomic<int> charge_off_above_{STACKCHAN_CHARGE_OFF_ABOVE};
+    std::atomic<ChargeAutoDecision> last_charge_auto_decision_{
+        (STACKCHAN_CHARGE_AUTO != 0)
+            ? ChargeAutoDecision::kNotRun
+            : ChargeAutoDecision::kAutoDisabled};
+    std::atomic<int> last_charge_auto_battery_level_{-1};
+    std::atomic<uint32_t> last_charge_auto_check_ms_{0};
     Aw9523* aw9523_;
     Ft6336* ft6336_;
     LcdDisplay* display_;
     EspVideo* camera_;
     esp_timer_handle_t touchpad_timer_;
     PowerSaveTimer* power_save_timer_;
+    // Opt-in: also dim / power off automatically on external power.
+    std::atomic<bool> external_power_auto_off_{false};
+    // Guards power_save_gate_ and the SetEnabled() calls it drives
+    // (battery poll from the display task, setter from the MCP task).
+    std::mutex power_save_gate_mutex_;
+    bool auto_sleep_enabled_ = true;  // guarded by power_save_gate_mutex_
+    stackchan::power::PowerSaveGate power_save_gate_{false};
+    esp_lcd_panel_io_handle_t lcd_panel_io_ = nullptr;
+    esp_lcd_panel_handle_t lcd_panel_ = nullptr;
+    esp_timer_handle_t screen_off_timer_ = nullptr;
+    SemaphoreHandle_t screen_power_mutex_ = nullptr;
+    std::atomic<int> screen_off_timeout_seconds_{
+        STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS};
+    std::atomic<bool> screen_is_off_{false};
+    int64_t screen_off_deadline_us_ = 0;  // guarded by screen_power_mutex_
+    int64_t panel_sleep_started_us_ = 0;  // guarded by screen_power_mutex_
+    uint8_t screen_saved_brightness_ = 75;  // guarded by screen_power_mutex_
+    bool panel_sleeping_ = false;  // guarded by screen_power_mutex_
+    bool panel_display_disabled_ = false;  // guarded by screen_power_mutex_
     ScsBus scs_bus_;
     std::unique_ptr<Py32IoExpander> io_expander_;
 
@@ -660,34 +919,23 @@ private:
     TtsLipSyncShape tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
 
     // Phase 7: Si12T head-touch sensing.
-    // Polling every TOUCH_POLL_MS samples Output1 (CH1..CH3 -> 3 head zones).
-    // Edge detection on the OR of the three zones produces TAP / STROKE
-    // gestures based on hold duration:
-    //   duration <  TAP_MAX_MS (400 ms)  -> TAP    -> face=surprised
-    //   duration >= STROKE_MIN_MS (600 ms) -> STROKE -> face=embarrassed + servo wobble
-    //   400 <= duration < 600 ms         -> treated as TAP (greyzone)
-    // Reactions auto-revert to "idle" after REACTION_HOLD_MS (3 s). A
-    // post-reaction COOLDOWN_MS lock-out prevents one head-pat from firing
-    // a chain of events.
+    // TouchPollTick() samples CH1..CH3 every TOUCH_POLL_MS and feeds
+    // stackchan::touch::TouchGestureTracker (touch_gesture.h), which decides:
+    //   TAP    : short press (40..500 ms) with no finger movement
+    //   STROKE : the finger moved from the zone it started on to another zone
+    // A press that does not move and lasts longer than 500 ms (a resting hand,
+    // or a channel whose baseline is stuck) produces no event. Channels that
+    // stay non-zero for 15 s get their baseline reset on the chip.
+    // Reactions revert to the "idle" face after TAP_REACTION_HOLD_MS /
+    // STROKE_REACTION_HOLD_MS.
     enum class TouchEvent : uint8_t {
         IDLE = 0,
         TAP,
         STROKE,
     };
-    static constexpr int TOUCH_POLL_MS    = 100;  // 100 Hz polling
-    static constexpr int TAP_MAX_MS       = 400;
-    static constexpr int STROKE_MIN_MS    = 400;  // was 600; lowered because
-                                                  // finger-glide between zones
-                                                  // and Si12T auto-recalibration
-                                                  // inject brief "all-false"
-                                                  // gaps that cut a real stroke
-                                                  // short of 600 ms.
-    static constexpr int REACTION_HOLD_MS = 3000;
-    static constexpr int COOLDOWN_MS      = 800;  // post-reaction noise gate
-    // With 2-sample debounce this gives ~200 ms confirm latency, fast enough
-    // to catch a quick "pon" (~200 ms press) while still rejecting single-
-    // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
-    // dropped most short taps.
+    static constexpr int TOUCH_POLL_MS    = 50;
+    static constexpr int TAP_REACTION_HOLD_MS    = 1200;
+    static constexpr int STROKE_REACTION_HOLD_MS = 1500;
     static constexpr int SERVO_WOBBLE_STEP_MS = 350;  // was 200; SCS0009 needs
                                                        // ~125 ms to physically
                                                        // travel ±20°, plus the
@@ -695,35 +943,31 @@ private:
                                                        // Tighter steps caused
                                                        // bus hangs.
     static constexpr int SERVO_WOBBLE_AMPLITUDE_DEG = 20;
+    // Value used when NVS touch/enabled has never been written.
+    static constexpr bool TOUCH_ENABLED_DEFAULT = true;
 
-    std::atomic<bool> touch_sensor_enabled_{true};
+    std::atomic<bool> touch_sensor_enabled_{TOUCH_ENABLED_DEFAULT};
     std::unique_ptr<Si12T> si12t_;
     bool si12t_ok_ = false;
     esp_timer_handle_t touch_poll_timer_ = nullptr;
     esp_timer_handle_t touch_revert_timer_ = nullptr;
 
-    // Touch detection state (single-thread access from the touch_poll_timer_
-    // callback, which runs on the ESP_TIMER_TASK).
-    bool touch_pressed_prev_ = false;          // last sample (debounced)
-    bool touch_pressed_pending_ = false;       // candidate awaiting confirm
-    int  touch_pending_count_ = 0;             // consecutive samples matching
-    uint64_t touch_press_start_us_ = 0;        // when pressed_prev_ went true
-    uint64_t cooldown_until_us_ = 0;           // ignore press until this ts
+    // Access is from the touch_poll_timer_ callback (ESP_TIMER_TASK) only,
+    // except for the diagnostic snapshots read by MCP get_touch_state.
+    stackchan::touch::TouchGestureTracker touch_tracker_;
+    int touch_last_charging_ = 0;
+    int touch_last_screen_off_ = 0;
+    bool touch_power_state_valid_ = false;
+    uint8_t touch_press_start_raw_ = 0;
 
     // Last reported event for MCP get_touch_state.
     TouchEvent last_event_ = TouchEvent::IDLE;
     uint64_t   last_event_us_ = 0;
     bool       last_zone_snapshot_[3] = {false, false, false};
     uint8_t    last_output1_raw_ = 0;
-    // Press-start snapshot. last_* fields above are overwritten every poll
-    // tick, so by the time HandleTap / HandleStroke fires on the falling edge
-    // they reflect the release state (zones=000 raw=0x00). press_start_*
-    // captures the rising-edge state so the log can show what the sensor
-    // actually saw when the touch began. Useful for distinguishing genuine
-    // touches (CH1〜CH3 set) from false positives (e.g. CH4 noise, raw=0x00
-    // with press judged via debounce, etc.).
-    bool       press_start_zones_[3] = {false, false, false};
-    uint8_t    press_start_output1_raw_ = 0;
+    std::atomic<uint8_t>  touch_masked_snapshot_{0};
+    std::atomic<uint32_t> touch_recal_snapshot_{0};
+    std::atomic<bool>     touch_in_grace_snapshot_{true};
 
     // Servo wobble sub-state. Keeps the previously-set angles untouched
     // before/after the wobble so that an external set_head_angles call is
@@ -2205,6 +2449,14 @@ private:
     }
 
     void InitializePowerSaveTimer() {
+        {
+            Settings settings(
+                STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE, false);
+            external_power_auto_off_.store(
+                settings.GetBool(STACKCHAN_EXTERNAL_POWER_AUTO_OFF_NVS_KEY,
+                                 false),
+                std::memory_order_release);
+        }
         power_save_timer_ = new PowerSaveTimer(
             -1, stackchan_power::kAutoSleepAfterSeconds,
             stackchan_power::kAutoShutdownAfterSeconds);
@@ -2219,7 +2471,11 @@ private:
         power_save_timer_->OnShutdownRequest([this]() {
             pmic_->PowerOff();
         });
-        power_save_timer_->SetEnabled(true);
+        Settings settings("wifi", false);
+        auto_sleep_enabled_ = settings.GetBool("sleep_mode", true);
+        power_save_timer_->SetEnabled(auto_sleep_enabled_);
+        power_save_gate_ = stackchan::power::PowerSaveGate(
+            power_save_timer_->IsEnabled());
     }
 
     stackchan_power::AutoSleepPersistenceRead ReadAutoSleepPolicyFromNvs() {
@@ -2300,14 +2556,391 @@ private:
                     ->WriteAutoSleepPolicyToNvs(enabled);
             },
             .set_timer_enabled = [](void* context, bool enabled) {
-                static_cast<StackChanBoard*>(context)
-                    ->power_save_timer_->SetEnabled(enabled);
+                auto* board = static_cast<StackChanBoard*>(context);
+                const bool discharging = board->pmic_->IsDischarging();
+                std::lock_guard<std::mutex> lock(board->power_save_gate_mutex_);
+                board->auto_sleep_enabled_ = enabled;
+                board->ApplyPowerSaveGateLocked(discharging);
             },
             .wake_up = [](void* context) {
                 static_cast<StackChanBoard*>(context)
                     ->power_save_timer_->WakeUp();
             },
         };
+    }
+
+    // Applies the dim / power-off policy for the current power source.
+    void ApplyPowerSaveGate(bool discharging) {
+        std::lock_guard<std::mutex> lock(power_save_gate_mutex_);
+        ApplyPowerSaveGateLocked(discharging);
+    }
+
+    void ApplyPowerSaveGateLocked(bool discharging) {
+        bool enable = false;
+        if (power_save_gate_.Update(
+                discharging,
+                external_power_auto_off_.load(std::memory_order_acquire),
+                &enable, auto_sleep_enabled_)) {
+            ESP_LOGI(TAG,
+                     "Power save timer %s (discharging=%d external_power_auto_off=%d)",
+                     enable ? "on" : "off", discharging ? 1 : 0,
+                     external_power_auto_off_.load(std::memory_order_acquire)
+                         ? 1
+                         : 0);
+            power_save_timer_->SetEnabled(enable);
+        }
+    }
+
+    esp_err_t SetExternalPowerAutoOff(bool enabled) {
+        esp_err_t err;
+        {
+            Settings settings(
+                STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE, true);
+            err = settings.SetBoolAndCommit(
+                STACKCHAN_EXTERNAL_POWER_AUTO_OFF_NVS_KEY, enabled);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to persist external_power_auto_off: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+        external_power_auto_off_.store(enabled, std::memory_order_release);
+        ApplyPowerSaveGate(pmic_->IsDischarging());
+        return ESP_OK;
+    }
+
+    cJSON* GetExternalPowerAutoOffJson(bool saved,
+                                       esp_err_t error = ESP_OK) {
+        bool discharging = pmic_->IsDischarging();
+        bool timer_enabled;
+        {
+            std::lock_guard<std::mutex> lock(power_save_gate_mutex_);
+            timer_enabled = power_save_timer_->IsEnabled();
+        }
+        cJSON* root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", error == ESP_OK);
+        cJSON_AddBoolToObject(root, "saved", saved);
+        cJSON_AddBoolToObject(
+            root, "external_power_auto_off",
+            external_power_auto_off_.load(std::memory_order_acquire));
+        cJSON_AddBoolToObject(root, "discharging", discharging);
+        cJSON_AddBoolToObject(root, "power_save_timer_enabled",
+                              timer_enabled);
+        cJSON_AddNumberToObject(root, "sleep_seconds",
+                                stackchan_power::kAutoSleepAfterSeconds);
+        cJSON_AddNumberToObject(root, "shutdown_seconds",
+                                stackchan_power::kAutoShutdownAfterSeconds);
+        cJSON_AddBoolToObject(root, "persistent", true);
+        cJSON_AddStringToObject(root, "persistence", "nvs");
+        cJSON_AddBoolToObject(root, "default", false);
+        cJSON_AddStringToObject(
+            root, "nvs_namespace",
+            STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE);
+        cJSON_AddStringToObject(root, "nvs_key",
+                                STACKCHAN_EXTERNAL_POWER_AUTO_OFF_NVS_KEY);
+        cJSON_AddStringToObject(root, "takes_effect", "immediate");
+        if (error != ESP_OK) {
+            cJSON_AddStringToObject(root, "error", esp_err_to_name(error));
+        }
+        return root;
+    }
+
+    void StopScreenOffTimerLocked() {
+        if (screen_off_timer_ == nullptr) {
+            return;
+        }
+        esp_err_t err = esp_timer_stop(screen_off_timer_);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop screen-off timer: %s",
+                     esp_err_to_name(err));
+        }
+    }
+
+    void StartScreenOffTimerLocked(int64_t delay_us) {
+        if (screen_off_timer_ == nullptr || delay_us <= 0) {
+            return;
+        }
+        StopScreenOffTimerLocked();
+        esp_err_t err = esp_timer_start_once(screen_off_timer_,
+                                             static_cast<uint64_t>(delay_us));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to start screen-off timer: %s",
+                     esp_err_to_name(err));
+        }
+    }
+
+    void ArmScreenOffTimerLocked() {
+        StopScreenOffTimerLocked();
+        int timeout_seconds =
+            screen_off_timeout_seconds_.load(std::memory_order_acquire);
+        if (timeout_seconds == 0) {
+            screen_off_deadline_us_ = 0;
+            return;
+        }
+        int64_t delay_us = static_cast<int64_t>(timeout_seconds) * 1000000LL;
+        screen_off_deadline_us_ = esp_timer_get_time() + delay_us;
+        StartScreenOffTimerLocked(delay_us);
+    }
+
+    void EnterPanelSleepLocked() {
+        if (lcd_panel_ == nullptr || lcd_panel_io_ == nullptr) {
+            ESP_LOGW(TAG, "LCD handles are not ready; using backlight-only screen off");
+            return;
+        }
+
+        esp_err_t display_err = esp_lcd_panel_disp_on_off(lcd_panel_, false);
+        if (display_err == ESP_OK) {
+            panel_display_disabled_ = true;
+        } else {
+            ESP_LOGW(TAG, "LCD display-off command failed (%s); backlight remains off",
+                     esp_err_to_name(display_err));
+        }
+
+        // esp_lcd_ili9341 v1.2.0 implements disp_on_off but does not install
+        // the esp_lcd_panel_t::disp_sleep callback. Use the same panel IO to
+        // issue the ILI9342C-compatible SLPIN command. Frame memory is kept.
+        esp_err_t sleep_err = esp_lcd_panel_io_tx_param(
+            lcd_panel_io_, LCD_CMD_SLPIN, nullptr, 0);
+        if (sleep_err == ESP_OK) {
+            panel_sleeping_ = true;
+            panel_sleep_started_us_ = esp_timer_get_time();
+        } else {
+            ESP_LOGW(TAG, "LCD sleep-in command failed (%s); backlight remains off",
+                     esp_err_to_name(sleep_err));
+        }
+    }
+
+    bool ExitPanelSleepLocked() {
+        if (lcd_panel_ == nullptr || lcd_panel_io_ == nullptr) {
+            ESP_LOGW(TAG, "LCD handles are not ready; restoring backlight only");
+            return true;
+        }
+
+        if (panel_sleeping_) {
+            // ILI9342C requires 120 ms between SLPIN and SLPOUT. A quick
+            // activity immediately after timeout therefore waits only the
+            // unelapsed remainder.
+            int64_t elapsed_ms =
+                (esp_timer_get_time() - panel_sleep_started_us_) / 1000LL;
+            if (elapsed_ms < STACKCHAN_LCD_SLEEP_TRANSITION_MS) {
+                vTaskDelay(pdMS_TO_TICKS(
+                    STACKCHAN_LCD_SLEEP_TRANSITION_MS - elapsed_ms));
+            }
+
+            esp_err_t wake_err = esp_lcd_panel_io_tx_param(
+                lcd_panel_io_, LCD_CMD_SLPOUT, nullptr, 0);
+            if (wake_err != ESP_OK) {
+                ESP_LOGW(TAG, "LCD sleep-out command failed (%s); keeping backlight off",
+                         esp_err_to_name(wake_err));
+                return false;
+            }
+            panel_sleeping_ = false;
+            panel_sleep_started_us_ = 0;
+
+            // ILI9342C needs 120 ms after SLPOUT before normal display
+            // operation is guaranteed.
+            vTaskDelay(pdMS_TO_TICKS(STACKCHAN_LCD_SLEEP_TRANSITION_MS));
+        }
+
+        if (panel_display_disabled_) {
+            esp_err_t display_err = esp_lcd_panel_disp_on_off(lcd_panel_, true);
+            if (display_err != ESP_OK) {
+                ESP_LOGW(TAG, "LCD display-on command failed (%s); keeping backlight off",
+                         esp_err_to_name(display_err));
+                return false;
+            }
+            panel_display_disabled_ = false;
+        }
+        return true;
+    }
+
+    void TurnScreenOffLocked() {
+        if (screen_is_off_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        auto backlight = static_cast<CustomBacklight*>(GetBacklight());
+        if (backlight != nullptr) {
+            screen_saved_brightness_ = backlight->brightness();
+            // CustomBacklight's normal SetBrightness path is driven by an
+            // esp_timer. Force the PMIC write here so brightness reaches zero
+            // before any panel power command is issued.
+            backlight->SetBrightnessImmediate(0);
+        }
+
+        if (display_ != nullptr) {
+            DisplayLockGuard lock(display_);
+            EnterPanelSleepLocked();
+        } else {
+            EnterPanelSleepLocked();
+        }
+        screen_is_off_.store(true, std::memory_order_release);
+        ESP_LOGI(TAG, "Screen turned off after idle timeout");
+    }
+
+    bool WakeScreenLocked() {
+        if (!screen_is_off_.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        bool panel_ready = false;
+        if (display_ != nullptr) {
+            DisplayLockGuard lock(display_);
+            panel_ready = ExitPanelSleepLocked();
+        } else {
+            panel_ready = ExitPanelSleepLocked();
+        }
+        if (!panel_ready) {
+            return false;
+        }
+
+        auto backlight = static_cast<CustomBacklight*>(GetBacklight());
+        if (backlight != nullptr) {
+            backlight->SetBrightnessImmediate(screen_saved_brightness_);
+        }
+
+        // Sleep In/Out on this panel retains frame memory, but the LVGL
+        // compositor's dirty-area tracking does not know the panel briefly
+        // stopped scanning it out. Without a forced full-area invalidate,
+        // the next natural partial redraw can flush a stale/half-composited
+        // frame onto the just-woken panel, seen as avatar double-display and
+        // horizontal tearing until an unrelated activity (e.g. an emotion
+        // change) happens to trigger a full redraw.
+        if (display_ != nullptr) {
+            DisplayLockGuard lock(display_);
+            lv_obj_invalidate(lv_screen_active());
+            ESP_LOGI(TAG, "Forcing full-screen redraw after wake");
+        }
+
+        screen_is_off_.store(false, std::memory_order_release);
+        ESP_LOGI(TAG, "Screen woke from idle timeout");
+        return true;
+    }
+
+    void ScreenOffTimerTick() {
+        if (screen_power_mutex_ == nullptr ||
+            xSemaphoreTake(screen_power_mutex_, portMAX_DELAY) != pdTRUE) {
+            return;
+        }
+
+        int timeout_seconds =
+            screen_off_timeout_seconds_.load(std::memory_order_acquire);
+        int64_t now_us = esp_timer_get_time();
+        if (timeout_seconds == 0) {
+            screen_off_deadline_us_ = 0;
+        } else if (screen_off_deadline_us_ > now_us) {
+            // An activity raced with an already-queued one-shot callback.
+            // Keep the newer deadline instead of turning the screen off.
+            StartScreenOffTimerLocked(screen_off_deadline_us_ - now_us);
+        } else {
+            TurnScreenOffLocked();
+        }
+
+        xSemaphoreGive(screen_power_mutex_);
+    }
+
+    static void ScreenOffTimerCb(void* arg) {
+        static_cast<StackChanBoard*>(arg)->ScreenOffTimerTick();
+    }
+
+    void InitializeScreenOffTimer() {
+        Settings settings(STACKCHAN_SCREEN_OFF_NVS_NAMESPACE, false);
+        int timeout_seconds = settings.GetInt(
+            STACKCHAN_SCREEN_OFF_NVS_KEY,
+            STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS);
+        if (timeout_seconds < 0 ||
+            timeout_seconds > STACKCHAN_SCREEN_OFF_MAX_TIMEOUT_SECONDS) {
+            ESP_LOGW(TAG,
+                     "Ignoring invalid persisted screen-off timeout %d; using default %d",
+                     timeout_seconds,
+                     STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS);
+            timeout_seconds = STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS;
+        }
+        screen_off_timeout_seconds_.store(timeout_seconds,
+                                          std::memory_order_release);
+
+        screen_power_mutex_ = xSemaphoreCreateMutex();
+        if (screen_power_mutex_ == nullptr) {
+            ESP_LOGW(TAG, "Failed to create screen power mutex; screen-off disabled");
+            return;
+        }
+
+        const esp_timer_create_args_t timer_args = {
+            .callback = &StackChanBoard::ScreenOffTimerCb,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "screen_off",
+            .skip_unhandled_events = true,
+        };
+        esp_err_t err = esp_timer_create(&timer_args, &screen_off_timer_);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to create screen-off timer: %s",
+                     esp_err_to_name(err));
+            return;
+        }
+
+        if (xSemaphoreTake(screen_power_mutex_, portMAX_DELAY) == pdTRUE) {
+            ArmScreenOffTimerLocked();
+            xSemaphoreGive(screen_power_mutex_);
+        }
+        ESP_LOGI(TAG, "Screen-off timeout: %d seconds%s", timeout_seconds,
+                 timeout_seconds == 0 ? " (disabled)" : "");
+    }
+
+    void HandleScreenActivity() {
+        if (screen_power_mutex_ == nullptr ||
+            xSemaphoreTake(screen_power_mutex_, portMAX_DELAY) != pdTRUE) {
+            return;
+        }
+        WakeScreenLocked();
+        ArmScreenOffTimerLocked();
+        xSemaphoreGive(screen_power_mutex_);
+    }
+
+    bool SetScreenOffTimeoutSeconds(int timeout_seconds) {
+        if (timeout_seconds < 0 ||
+            timeout_seconds > STACKCHAN_SCREEN_OFF_MAX_TIMEOUT_SECONDS) {
+            return false;
+        }
+
+        {
+            Settings settings(STACKCHAN_SCREEN_OFF_NVS_NAMESPACE, true);
+            settings.SetInt(STACKCHAN_SCREEN_OFF_NVS_KEY, timeout_seconds);
+        }
+
+        if (screen_power_mutex_ == nullptr ||
+            xSemaphoreTake(screen_power_mutex_, portMAX_DELAY) != pdTRUE) {
+            screen_off_timeout_seconds_.store(timeout_seconds,
+                                              std::memory_order_release);
+            return true;
+        }
+
+        screen_off_timeout_seconds_.store(timeout_seconds,
+                                          std::memory_order_release);
+        if (timeout_seconds == 0) {
+            WakeScreenLocked();
+        }
+        ArmScreenOffTimerLocked();
+        xSemaphoreGive(screen_power_mutex_);
+        return true;
+    }
+
+    cJSON* GetScreenOffTimeoutJson(bool applied = true) const {
+        int timeout_seconds =
+            screen_off_timeout_seconds_.load(std::memory_order_acquire);
+        cJSON* root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", applied);
+        cJSON_AddBoolToObject(root, "applied", applied);
+        cJSON_AddNumberToObject(root, "timeout_seconds", timeout_seconds);
+        cJSON_AddBoolToObject(root, "persistent", true);
+        cJSON_AddStringToObject(root, "persistence", "nvs");
+        cJSON_AddBoolToObject(
+            root, "enabled",
+            timeout_seconds != 0 && screen_off_timer_ != nullptr);
+        cJSON_AddBoolToObject(
+            root, "screen_off",
+            screen_is_off_.load(std::memory_order_acquire));
+        return root;
     }
 
     void InitializeI2c() {
@@ -2463,9 +3096,265 @@ private:
         }
     }
 
+    static const char* ChargeAutoDecisionName(ChargeAutoDecision decision) {
+        switch (decision) {
+            case ChargeAutoDecision::kEnabledLowBattery:
+                return "enabled_low_battery";
+            case ChargeAutoDecision::kDisabledHighBattery:
+                return "disabled_high_battery";
+            case ChargeAutoDecision::kKeptBetweenThresholds:
+                return "kept_between_thresholds";
+            case ChargeAutoDecision::kEnabledBatteryReadFailed:
+                return "enabled_battery_read_failed";
+            case ChargeAutoDecision::kProtectionDisabled:
+                return "charge_protection_disabled";
+            case ChargeAutoDecision::kAutoDisabled:
+                return "auto_disabled";
+            case ChargeAutoDecision::kNotRun:
+            default:
+                return "not_run";
+        }
+    }
+
+    bool ReadBatteryLevel(int* level) {
+        return pmic_ != nullptr && pmic_->TryGetBatteryLevel(level);
+    }
+
+    bool IsChargeProtectionEffective() const {
+        return charge_protection_.load(std::memory_order_acquire);
+    }
+
+    // Charging is the resting state at startup; protection engages only at
+    // the persisted upper threshold.
+    void ApplyAutomaticChargePolicy(int level, bool level_available) {
+        if (!IsChargeProtectionEffective()) {
+            last_charge_auto_decision_.store(
+                ChargeAutoDecision::kProtectionDisabled,
+                std::memory_order_release);
+            return;
+        }
+
+        last_charge_auto_battery_level_.store(
+            level_available ? level : -1, std::memory_order_relaxed);
+
+        if (!level_available) {
+            pmic_->SetChargeEnabled(true);
+            last_charge_auto_decision_.store(
+                ChargeAutoDecision::kEnabledBatteryReadFailed,
+                std::memory_order_release);
+            ESP_LOGW(TAG,
+                     "Battery level unavailable; charging enabled as fail-safe");
+            return;
+        }
+
+        int on_below = charge_on_below_.load(std::memory_order_acquire);
+        int off_above = charge_off_above_.load(std::memory_order_acquire);
+        ChargeAutoDecision decision;
+        if (level <= on_below) {
+            pmic_->SetChargeEnabled(true);
+            decision = ChargeAutoDecision::kEnabledLowBattery;
+        } else if (level >= off_above) {
+            pmic_->SetChargeEnabled(false);
+            decision = ChargeAutoDecision::kDisabledHighBattery;
+        } else {
+            // Hysteresis band: intentionally make no PMIC write.
+            decision = ChargeAutoDecision::kKeptBetweenThresholds;
+        }
+
+        last_charge_auto_decision_.store(decision,
+                                         std::memory_order_release);
+        ESP_LOGI(TAG, "Automatic charge check: level=%d decision=%s",
+                 level, ChargeAutoDecisionName(decision));
+    }
+
+    // Reuse the existing one-second status-bar battery poll, but only make an
+    // automatic decision approximately once per 60 seconds. Unsigned
+    // subtraction keeps the interval correct when the 32-bit millisecond
+    // counter wraps. The startup call bypasses the interval exactly once.
+    void MaybeApplyAutomaticChargePolicy(int level, bool level_available,
+                                         bool startup = false) {
+        if (!IsChargeProtectionEffective()) {
+            return;
+        }
+
+        uint32_t now_ms =
+            static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        if (startup) {
+            last_charge_auto_check_ms_.store(now_ms,
+                                             std::memory_order_relaxed);
+        } else {
+            uint32_t last_ms =
+                last_charge_auto_check_ms_.load(std::memory_order_relaxed);
+            do {
+                if (static_cast<uint32_t>(now_ms - last_ms) <
+                    CHARGE_AUTO_INTERVAL_MS) {
+                    return;
+                }
+            } while (!last_charge_auto_check_ms_.compare_exchange_weak(
+                last_ms, now_ms, std::memory_order_relaxed));
+        }
+
+        ApplyAutomaticChargePolicy(level, level_available);
+    }
+
+    void ApplyChargeProtectionSetting(bool enabled) {
+        charge_protection_.store(enabled, std::memory_order_release);
+
+        uint32_t now_ms =
+            static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        last_charge_auto_check_ms_.store(now_ms, std::memory_order_relaxed);
+
+        if (!enabled) {
+            // This enables the AXP2101 charger; its own full-charge
+            // termination remains responsible for stopping cell current.
+            pmic_->SetChargeEnabled(true);
+            last_charge_auto_decision_.store(
+                ChargeAutoDecision::kProtectionDisabled,
+                std::memory_order_release);
+            ESP_LOGI(TAG,
+                     "Charge protection disabled: charging allowed immediately");
+            return;
+        }
+
+        // Re-evaluate immediately. In the hysteresis band the current PMIC
+        // state is intentionally retained.
+        int level = -1;
+        bool level_available = ReadBatteryLevel(&level);
+        ApplyAutomaticChargePolicy(level, level_available);
+    }
+
+    esp_err_t SetChargeProtection(bool enabled) {
+        esp_err_t err;
+        {
+            Settings settings(
+                STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE, true);
+            err = settings.SetBoolAndCommit(
+                STACKCHAN_CHARGE_PROTECTION_NVS_KEY, enabled);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to persist charge protection: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+
+        ApplyChargeProtectionSetting(enabled);
+        return ESP_OK;
+    }
+
+    static bool AreChargeThresholdsValid(int on_below, int off_above) {
+        return on_below >= 0 && off_above <= 100 &&
+               on_below < off_above;
+    }
+
+    esp_err_t SetChargeThresholds(int on_below, int off_above) {
+        if (!AreChargeThresholdsValid(on_below, off_above)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        esp_err_t err;
+        {
+            Settings settings(
+                STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE, true);
+            err = settings.SetIntPairAndCommit(
+                STACKCHAN_CHARGE_ON_BELOW_NVS_KEY, on_below,
+                STACKCHAN_CHARGE_OFF_ABOVE_NVS_KEY, off_above);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to persist charge thresholds: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+
+        charge_on_below_.store(on_below, std::memory_order_release);
+        charge_off_above_.store(off_above, std::memory_order_release);
+        if (IsChargeProtectionEffective()) {
+            int level = -1;
+            bool level_available = ReadBatteryLevel(&level);
+            ApplyAutomaticChargePolicy(level, level_available);
+            last_charge_auto_check_ms_.store(
+                static_cast<uint32_t>(esp_timer_get_time() / 1000),
+                std::memory_order_relaxed);
+        }
+        return ESP_OK;
+    }
+
+    cJSON* GetChargeProtectionJson(bool saved,
+                                   esp_err_t error = ESP_OK) {
+        bool configured =
+            charge_protection_.load(std::memory_order_acquire);
+        cJSON* root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", error == ESP_OK);
+        cJSON_AddBoolToObject(root, "saved", saved);
+        cJSON_AddBoolToObject(root, "charge_protection", configured);
+        cJSON_AddBoolToObject(root, "persisted_charge_protection", configured);
+        cJSON_AddBoolToObject(root, "effective_charge_protection",
+                              IsChargeProtectionEffective());
+        cJSON_AddBoolToObject(root, "charge_enabled",
+                              pmic_->IsChargeEnabled());
+        cJSON_AddBoolToObject(root, "persistent", true);
+        cJSON_AddStringToObject(root, "persistence", "nvs");
+        cJSON_AddBoolToObject(root, "default",
+                              STACKCHAN_CHARGE_AUTO != 0);
+        cJSON_AddStringToObject(
+            root, "nvs_namespace",
+            STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE);
+        cJSON_AddStringToObject(root, "nvs_key",
+                                STACKCHAN_CHARGE_PROTECTION_NVS_KEY);
+        cJSON_AddNumberToObject(
+            root, "on_below",
+            charge_on_below_.load(std::memory_order_acquire));
+        cJSON_AddNumberToObject(
+            root, "off_above",
+            charge_off_above_.load(std::memory_order_acquire));
+        cJSON_AddStringToObject(root, "on_below_nvs_key",
+                                STACKCHAN_CHARGE_ON_BELOW_NVS_KEY);
+        cJSON_AddStringToObject(root, "off_above_nvs_key",
+                                STACKCHAN_CHARGE_OFF_ABOVE_NVS_KEY);
+        cJSON_AddStringToObject(root, "takes_effect", "immediate");
+        if (error != ESP_OK) {
+            cJSON_AddStringToObject(root, "error", esp_err_to_name(error));
+        }
+        return root;
+    }
+
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
-        pmic_ = new Pmic(i2c_bus_, 0x34);
+        Settings settings(
+            STACKCHAN_CHARGE_PROTECTION_NVS_NAMESPACE, false);
+        bool protection_enabled = settings.GetBool(
+            STACKCHAN_CHARGE_PROTECTION_NVS_KEY,
+            STACKCHAN_CHARGE_AUTO != 0);
+        int on_below = settings.GetInt(
+            STACKCHAN_CHARGE_ON_BELOW_NVS_KEY,
+            STACKCHAN_CHARGE_ON_BELOW);
+        int off_above = settings.GetInt(
+            STACKCHAN_CHARGE_OFF_ABOVE_NVS_KEY,
+            STACKCHAN_CHARGE_OFF_ABOVE);
+        if (!AreChargeThresholdsValid(on_below, off_above)) {
+            ESP_LOGW(TAG,
+                     "Ignoring invalid persisted charge thresholds %d/%d; using defaults %d/%d",
+                     on_below, off_above, STACKCHAN_CHARGE_ON_BELOW,
+                     STACKCHAN_CHARGE_OFF_ABOVE);
+            on_below = STACKCHAN_CHARGE_ON_BELOW;
+            off_above = STACKCHAN_CHARGE_OFF_ABOVE;
+        }
+        charge_protection_.store(protection_enabled,
+                                 std::memory_order_release);
+        charge_on_below_.store(on_below, std::memory_order_release);
+        charge_off_above_.store(off_above, std::memory_order_release);
+
+        pmic_ = new Pmic(i2c_bus_, 0x34, protection_enabled);
+        if (protection_enabled) {
+            int level = -1;
+            bool level_available = ReadBatteryLevel(&level);
+            MaybeApplyAutomaticChargePolicy(level, level_available, true);
+        } else {
+            last_charge_auto_decision_.store(
+                ChargeAutoDecision::kProtectionDisabled,
+                std::memory_order_release);
+            ESP_LOGI(TAG,
+                     "Charge protection disabled by persisted setting; charging allowed");
+        }
     }
 
     void InitializeAw9523() {
@@ -2661,6 +3550,9 @@ private:
 
         ft6336_->UpdateTouchPoint();
         auto& touch_point = ft6336_->GetTouchPoint();
+        if (touch_point.num > 0) {
+            HandleScreenActivity();
+        }
 
         // 检测触摸开始
         if (touch_point.num > 0 && !was_touched) {
@@ -2804,6 +3696,8 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
+        lcd_panel_io_ = panel_io;
+        lcd_panel_ = panel;
         display_ = new SpiLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
@@ -4206,7 +5100,7 @@ private:
         }
     }
 
-    // Schedule a single-shot revert to "idle" face REACTION_HOLD_MS later.
+    // Schedule a single-shot revert to "idle" face `hold_ms` later.
     // Re-arming overwrites any pending revert. Skipped while the avatar
     // has been hidden via set_avatar("off"), so a stale revert timer
     // does not re-cover the LCD after the user explicitly hid it.
@@ -4215,7 +5109,7 @@ private:
         self->SetAvatarExpressionIfActive("idle");
     }
 
-    void ScheduleIdleRevert() {
+    void ScheduleIdleRevert(int hold_ms) {
         if (touch_revert_timer_ == nullptr) {
             esp_timer_create_args_t args = {
                 .callback = &StackChanBoard::TouchRevertCb,
@@ -4227,8 +5121,7 @@ private:
             ESP_ERROR_CHECK(esp_timer_create(&args, &touch_revert_timer_));
         }
         esp_timer_stop(touch_revert_timer_);  // ok if not running
-        esp_timer_start_once(touch_revert_timer_,
-                             (uint64_t)REACTION_HOLD_MS * 1000);
+        esp_timer_start_once(touch_revert_timer_, (uint64_t)hold_ms * 1000);
     }
 
     // Decode a 2-bit channel level from the Si12T Output1 byte.
@@ -4238,57 +5131,59 @@ private:
         return "0LMH"[v];
     }
 
-    // Emit the touch event log line. press_zones/press_raw are the
-    // rising-edge snapshot (= the touch the user actually made);
-    // release_raw is whatever the sensor reports at the falling edge
-    // (normally 0x00 — anything else hints at debounce / hysteresis quirks).
-    // ch=%c%c%c%c spells CH1〜CH4 levels using 0/L/M/H. CH4 is unused on
-    // stack-chan (the head has 3 zones), so anything non-0 on CH4 is a
-    // wiring noise / EMI signature worth investigating.
-    void LogTouchEvent(const char* event_name, uint64_t duration_ms) {
+    // Emit the touch event log line. press_start_raw is the Output1 byte seen
+    // when the press began; ch=%c%c%c%c spells its CH1..CH4 levels using
+    // 0/L/M/H. CH4 is unused on stack-chan (the head has 3 zones), so anything
+    // non-0 on CH4 is a wiring noise / EMI signature worth investigating.
+    void LogTouchEvent(const char* event_name, uint8_t start_zones, uint32_t duration_ms) {
         ESP_LOGI(TAG,
                  "touch event: %s start_zones=%d%d%d start_raw=0x%02X ch=%c%c%c%c "
                  "release_raw=0x%02X duration=%u ms",
                  event_name,
-                 press_start_zones_[0], press_start_zones_[1], press_start_zones_[2],
-                 press_start_output1_raw_,
-                 Si12tChLevelChar(press_start_output1_raw_, 0),
-                 Si12tChLevelChar(press_start_output1_raw_, 1),
-                 Si12tChLevelChar(press_start_output1_raw_, 2),
-                 Si12tChLevelChar(press_start_output1_raw_, 3),
+                 start_zones & 1, (start_zones >> 1) & 1, (start_zones >> 2) & 1,
+                 touch_press_start_raw_,
+                 Si12tChLevelChar(touch_press_start_raw_, 0),
+                 Si12tChLevelChar(touch_press_start_raw_, 1),
+                 Si12tChLevelChar(touch_press_start_raw_, 2),
+                 Si12tChLevelChar(touch_press_start_raw_, 3),
                  last_output1_raw_,
                  (unsigned)duration_ms);
     }
 
-    void HandleTap(uint64_t duration_ms) {
-        if (!touch_sensor_enabled_.load(std::memory_order_acquire)) {
-            return;
-        }
-        LogTouchEvent("TAP", duration_ms);
+    void HandleTap(uint8_t start_zones, uint32_t duration_ms) {
+        LogTouchEvent("TAP", start_zones, duration_ms);
         last_event_ = TouchEvent::TAP;
         last_event_us_ = esp_timer_get_time();
+        HandleScreenActivity();
         // Use the IfActive variant so a tap during set_avatar("off") does
         // not pop the avatar back over the WiFi config / settings screens.
         SetAvatarExpressionIfActive("surprised");
-        ScheduleIdleRevert();
+        ScheduleIdleRevert(TAP_REACTION_HOLD_MS);
         Application::GetInstance().SendStackChanEvent("touch", "tap", duration_ms);
     }
 
-    void HandleStroke(uint64_t duration_ms) {
-        if (!touch_sensor_enabled_.load(std::memory_order_acquire)) {
-            return;
-        }
-        LogTouchEvent("STROKE", duration_ms);
+    // Fired the moment the finger is seen moving across zones, so the face
+    // reacts while the stroke is still going on.
+    void HandleStrokeMoving() {
+        SetAvatarExpressionIfActive("embarrassed");
+        ScheduleIdleRevert(STROKE_REACTION_HOLD_MS);
+    }
+
+    void HandleStroke(uint8_t start_zones, uint32_t duration_ms) {
+        LogTouchEvent("STROKE", start_zones, duration_ms);
         last_event_ = TouchEvent::STROKE;
         last_event_us_ = esp_timer_get_time();
+        HandleScreenActivity();
         SetAvatarExpressionIfActive("embarrassed");
         StartServoWobble();
-        ScheduleIdleRevert();
+        ScheduleIdleRevert(STROKE_REACTION_HOLD_MS);
         Application::GetInstance().SendStackChanEvent("touch", "stroke", duration_ms);
     }
 
-    // 200 ms periodic poll. Reads the sensor, applies a 2-sample debounce on
-    // the OR of the three head zones, and emits TAP/STROKE on falling edges.
+    // 50 ms periodic poll. Reads the sensor and runs the gesture tracker. The
+    // tracker keeps running while the touch feature is disabled (so the stuck-
+    // channel recovery and get_touch_state diagnostics stay live), but nothing
+    // is reported, no reaction is shown and the screen-off timer is untouched.
     static void TouchPollCb(void* arg) {
         StackChanBoard* self = static_cast<StackChanBoard*>(arg);
         self->TouchPollTick();
@@ -4302,82 +5197,67 @@ private:
         if (!s.ok) {
             return;
         }
+        const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+        const int charging = (pmic_ != nullptr && pmic_->IsCharging()) ? 1 : 0;
+        const int screen_off = screen_is_off_.load(std::memory_order_relaxed) ? 1 : 0;
+        if (touch_power_state_valid_ &&
+            (charging != touch_last_charging_ || screen_off != touch_last_screen_off_)) {
+            touch_tracker_.NotifySettle(now_ms);
+            ESP_LOGI(TAG, "touch: charging=%d->%d screen_off=%d->%d, ignoring touch for 1 s then resetting baseline",
+                     touch_last_charging_, charging, touch_last_screen_off_, screen_off);
+        }
+        touch_last_charging_ = charging;
+        touch_last_screen_off_ = screen_off;
+        touch_power_state_valid_ = true;
+        if (s.output1_raw != last_output1_raw_) {
+            ESP_LOGI(TAG, "touch raw: 0x%02X -> 0x%02X charging=%d screen_off=%d",
+                     last_output1_raw_, s.output1_raw, charging, screen_off);
+        }
         // Snapshot for MCP visibility.
         last_output1_raw_ = s.output1_raw;
         last_zone_snapshot_[0] = s.zone[0];
         last_zone_snapshot_[1] = s.zone[1];
         last_zone_snapshot_[2] = s.zone[2];
 
-        bool any_pressed = s.zone[0] || s.zone[1] || s.zone[2];
-
-        // Asymmetric debounce:
-        //   press   confirm = 2 samples ( 200 ms) — fast tap detection
-        //   release confirm = 4 samples ( 400 ms) — bridges Si12T recalibration
-        //                                            and finger-glide gaps that
-        //                                            otherwise cut a stroke
-        //                                            short and mis-classify it
-        //                                            as a tap.
-        // Keeping a press "sticky" through brief no-press blips is essential
-        // for the stroke gesture to reach STROKE_MIN_MS.
-        if (any_pressed == touch_pressed_pending_) {
-            touch_pending_count_++;
-        } else {
-            touch_pending_count_ = 1;
-            touch_pressed_pending_ = any_pressed;
+        const bool was_pressed = touch_tracker_.pressed();
+        stackchan::touch::TouchGestureOutput o = touch_tracker_.Update(now_ms, s.level);
+        if (!was_pressed && touch_tracker_.pressed()) {
+            touch_press_start_raw_ = s.output1_raw;
         }
-        const int needed = touch_pressed_pending_ ? 2 : 4;
-        if (touch_pending_count_ < needed) {
-            return;  // not yet debounced
+        touch_masked_snapshot_.store(touch_tracker_.masked_channels(), std::memory_order_relaxed);
+        touch_recal_snapshot_.store(touch_tracker_.recalibrations(), std::memory_order_relaxed);
+        touch_in_grace_snapshot_.store(touch_tracker_.in_boot_grace(), std::memory_order_relaxed);
+
+        if (o.recal_mask != 0 && o.settle_reset) {
+            si12t_->ResetReference(o.recal_mask);
+            ESP_LOGI(TAG, "touch: baseline reset after charging/backlight switch (raw=0x%02X, total %u)",
+                     s.output1_raw, (unsigned)touch_tracker_.settle_resets());
+        } else if (o.recal_mask != 0) {
+            si12t_->ResetReference(o.recal_mask);
+            ESP_LOGW(TAG, "touch: channel stuck >= 15 s, reset Si12T baseline mask=0x%02X raw=0x%02X (total %u)",
+                     o.recal_mask, s.output1_raw, (unsigned)touch_tracker_.recalibrations());
         }
-
-        bool now = touch_pressed_pending_;
-        if (now == touch_pressed_prev_) {
-            return;  // no edge
+        if (o.ended_without_event) {
+            ESP_LOGI(TAG, "touch press ignored%s: start_raw=0x%02X release_raw=0x%02X peak=L%u duration=%u ms",
+                     o.dropped_weak ? " (below H)" : "", touch_press_start_raw_, s.output1_raw,
+                     (unsigned)o.peak_level, (unsigned)o.duration_ms);
         }
-
-        uint64_t now_us = esp_timer_get_time();
-
-        if (now) {
-            // Rising edge. Capture the sensor state for the falling-edge
-            // log either way — without this, a press that begins during
-            // the post-reaction cooldown and is held until the cooldown
-            // expires would log the previous touch's start_zones /
-            // start_raw on its falling edge, exactly the
-            // repeated-touch / noise-overlap scenario this logging is
-            // meant to clarify.
-            press_start_zones_[0] = s.zone[0];
-            press_start_zones_[1] = s.zone[1];
-            press_start_zones_[2] = s.zone[2];
-            press_start_output1_raw_ = s.output1_raw;
-            if (now_us < cooldown_until_us_) {
-                // Suppress press event while in post-reaction cooldown.
-                touch_pressed_prev_ = now;
-                touch_press_start_us_ = now_us;
-                return;
-            }
-            touch_pressed_prev_ = true;
-            touch_press_start_us_ = now_us;
-        } else {
-            // Falling edge: classify by hold duration.
-            touch_pressed_prev_ = false;
-            uint64_t duration_ms = (now_us - touch_press_start_us_) / 1000ULL;
-            if (now_us < cooldown_until_us_) {
-                // We were in cooldown when pressed — drop the release event too.
-                return;
-            }
-            if (duration_ms >= STROKE_MIN_MS) {
-                HandleStroke(duration_ms);
-            } else {
-                // Treat the 400-600 ms grey zone as TAP.
-                HandleTap(duration_ms);
-            }
-            cooldown_until_us_ = now_us + (uint64_t)COOLDOWN_MS * 1000ULL;
+        if (!touch_sensor_enabled_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (o.moved_now) {
+            HandleStrokeMoving();
+        }
+        if (o.event == stackchan::touch::TouchGestureEvent::TAP) {
+            HandleTap(o.start_zones, o.duration_ms);
+        } else if (o.event == stackchan::touch::TouchGestureEvent::STROKE) {
+            HandleStroke(o.start_zones, o.duration_ms);
         }
     }
 
     void InitializeTouchSettings() {
         Settings settings("touch", false);
-        bool enabled = settings.GetBool("enabled", true);
+        bool enabled = settings.GetBool("enabled", TOUCH_ENABLED_DEFAULT);
         touch_sensor_enabled_.store(enabled, std::memory_order_release);
         ESP_LOGI(TAG, "Touch sensor setting loaded: enabled=%d", enabled ? 1 : 0);
     }
@@ -4387,10 +5267,11 @@ private:
         si12t_ = std::unique_ptr<Si12T>(new Si12T(i2c_bus_));
         si12t_ok_ = si12t_->Begin();
         if (!si12t_ok_) {
-            ESP_LOGW(TAG, "Si12T not detected; head-touch disabled (other features unaffected)");
+            ESP_LOGW(TAG, "Si12T init failed or not detected; head-touch disabled (other features unaffected)");
             si12t_.reset();
             return;
         }
+        touch_tracker_.Begin(static_cast<uint32_t>(esp_timer_get_time() / 1000ULL));
 
         esp_timer_create_args_t poll_args = {
             .callback = &StackChanBoard::TouchPollCb,
@@ -4402,7 +5283,7 @@ private:
         ESP_ERROR_CHECK(esp_timer_create(&poll_args, &touch_poll_timer_));
         ESP_ERROR_CHECK(esp_timer_start_periodic(touch_poll_timer_,
                                                  (uint64_t)TOUCH_POLL_MS * 1000));
-        ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval)", TOUCH_POLL_MS);
+        ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval, first 10 s ignored)", TOUCH_POLL_MS);
     }
 
     // Map a face name to AvatarSet's 0-indexed slot, or -1 if unknown.
@@ -5502,6 +6383,31 @@ private:
         ESP_LOGI(TAG, "Registering StackChan MCP tools...");
 
         mcp_server.AddTool(
+            "self.screen.set_off_timeout",
+            "Set the StackChan idle screen-off timeout in seconds. The value "
+            "is saved to NVS and applied immediately. Use 0 to disable idle "
+            "screen-off and wake the screen if it is currently off. Valid "
+            "range: 0..86400 seconds.",
+            PropertyList({
+                Property("seconds", kPropertyTypeInteger, 0,
+                         STACKCHAN_SCREEN_OFF_MAX_TIMEOUT_SECONDS)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int timeout_seconds = properties["seconds"].value<int>();
+                bool applied = SetScreenOffTimeoutSeconds(timeout_seconds);
+                return GetScreenOffTimeoutJson(applied);
+            });
+
+        mcp_server.AddTool(
+            "self.screen.get_off_timeout",
+            "Get the effective NVS-backed StackChan idle screen-off timeout, "
+            "whether it is enabled, and whether the screen is currently off.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                return GetScreenOffTimeoutJson();
+            });
+
+        mcp_server.AddTool(
             "self.gateway_config.get",
             "Read the NVS-backed WebSocket gateway connection settings. "
             "Returns websocket.url, websocket.fallback_url, token_set (never "
@@ -6094,8 +7000,10 @@ private:
             "self.power.set_auto_sleep",
             "Persist and immediately apply the StackChan automatic "
             "display-sleep and PMIC shutdown policy. Enabling always "
-            "restarts the countdown from zero; disabling wakes the display "
-            "and cancels the shutdown countdown.",
+            "restarts the countdown from zero when the power-source policy "
+            "allows it. External power also requires external_power_auto_off. "
+            "Disabling wakes the display and cancels the shutdown countdown. "
+            "The separate screen-off timeout is unchanged.",
             PropertyList({Property("enabled", kPropertyTypeBoolean)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 const bool enabled = properties["enabled"].value<bool>();
@@ -6428,6 +7336,14 @@ private:
                 cJSON_AddBoolToObject(root, "zone1", last_zone_snapshot_[1]);
                 cJSON_AddBoolToObject(root, "zone2", last_zone_snapshot_[2]);
                 cJSON_AddNumberToObject(root, "raw", last_output1_raw_);
+                cJSON_AddBoolToObject(root, "enabled",
+                                      touch_sensor_enabled_.load(std::memory_order_acquire));
+                cJSON_AddNumberToObject(root, "masked",
+                                        touch_masked_snapshot_.load(std::memory_order_relaxed));
+                cJSON_AddNumberToObject(root, "recalibrations",
+                                        touch_recal_snapshot_.load(std::memory_order_relaxed));
+                cJSON_AddBoolToObject(root, "boot_grace",
+                                      touch_in_grace_snapshot_.load(std::memory_order_relaxed));
                 const char* ev = "idle";
                 switch (last_event_) {
                     case TouchEvent::TAP:    ev = "tap";    break;
@@ -7350,6 +8266,185 @@ private:
                 return root;
             });
 
+        mcp_server.AddTool(
+            "self.power.set_external_power_auto_off",
+            "Persist and immediately apply whether StackChan also dims "
+            "(after 60 s idle) and powers off (after 300 s idle) while on "
+            "external power. Default false: on external power it never "
+            "dims or powers off via this timer; on battery it does when "
+            "auto_sleep is enabled. The separate screen-off timeout remains "
+            "active. auto_sleep=false disables this timer on both sources. "
+            "The idle timer never counts while the gateway is connected. "
+            "Stored in NVS (namespace stackchan, key ext_auto_off). A "
+            "failed NVS save returns ok=false and leaves the setting "
+            "unchanged.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                esp_err_t err = SetExternalPowerAutoOff(enabled);
+                return GetExternalPowerAutoOffJson(err == ESP_OK, err);
+            });
+
+        mcp_server.AddTool(
+            "self.power.get_external_power_auto_off",
+            "Get the NVS-backed external_power_auto_off setting, whether "
+            "the battery is discharging, and whether the automatic dim / "
+            "power-off timer is currently running.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                return GetExternalPowerAutoOffJson(true);
+            });
+
+        mcp_server.AddTool(
+            "self.power.set_charge_protection",
+            "Persist and immediately apply StackChan battery charge "
+            "protection. The unset NVS default follows the compile-time "
+            "STACKCHAN_CHARGE_AUTO default (off unless overridden). "
+            "enabled=true uses the persisted ON/OFF thresholds. "
+            "enabled=false bypasses that policy and enables the AXP2101 "
+            "charger so its own full-charge termination can finish a full "
+            "charge. Switching protection back on immediately re-evaluates "
+            "the current battery level. The public setting is "
+            "charge_protection; its NVS key is shortened to chg_protect to "
+            "fit the ESP-IDF 15-character name limit. A failed NVS save "
+            "returns ok=false and leaves the effective setting unchanged.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                esp_err_t err = SetChargeProtection(enabled);
+                return GetChargeProtectionJson(err == ESP_OK, err);
+            });
+
+        mcp_server.AddTool(
+            "self.power.get_charge_protection",
+            "Get the NVS-backed and effective StackChan charge_protection "
+            "setting, current AXP2101 charge-enable state, and the persisted "
+            "ON/OFF thresholds. An unset NVS value follows the compile-time "
+            "STACKCHAN_CHARGE_AUTO default.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                return GetChargeProtectionJson(true);
+            });
+
+        mcp_server.AddTool(
+            "self.power.set_charge_thresholds",
+            "Persist and immediately apply the battery percentages used by "
+            "charge protection. on_below must be lower than off_above. "
+            "Values are stored together in NVS; invalid pairs are rejected "
+            "without changing the active thresholds.",
+            PropertyList({
+                Property("on_below", kPropertyTypeInteger, 0, 100),
+                Property("off_above", kPropertyTypeInteger, 0, 100),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int on_below = properties["on_below"].value<int>();
+                int off_above = properties["off_above"].value<int>();
+                esp_err_t err = SetChargeThresholds(on_below, off_above);
+                return GetChargeProtectionJson(err == ESP_OK, err);
+            });
+
+        mcp_server.AddTool(
+            "self.power.set_charge_enabled",
+            "Enable or disable AXP2101 cell battery charging (register "
+            "0x18 bit1, Read-Modify-Write; the fuel gauge enable bit and "
+            "every other bit are preserved). Takes effect immediately "
+            "over I2C and is read back from the PMIC before returning. "
+            "When charge_protection is enabled, this manual setting "
+            "is temporary and may be overwritten by the startup decision "
+            "or the next approximately 60-second automatic decision. When "
+            "charge_protection is disabled, the setting is still not "
+            "persisted to NVS and the boot default "
+            "(STACKCHAN_DEFAULT_CHARGE_ENABLED) applies on reboot. "
+            "Disabling charging only stops "
+            "current flowing into the cell; it does not cut USB power to "
+            "the system (VBUS keeps powering VSYS through a separate "
+            "path per the AXP2101 datasheet).",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                pmic_->SetChargeEnabled(enabled);
+                bool actual = pmic_->IsChargeEnabled();
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", actual == enabled);
+                cJSON_AddBoolToObject(root, "charge_enabled", actual);
+                cJSON_AddNumberToObject(root, "reg_0x18", pmic_->GetChargeControlRegister());
+                cJSON_AddStringToObject(root, "takes_effect", "immediate");
+                cJSON_AddStringToObject(root, "persistence", "volatile_resets_on_boot");
+                cJSON_AddBoolToObject(root, "auto_enabled",
+                                      IsChargeProtectionEffective());
+                cJSON_AddBoolToObject(root,
+                                      "manual_may_be_overridden_by_auto",
+                                      IsChargeProtectionEffective());
+                cJSON_AddStringToObject(
+                    root, "automatic_control_note",
+                    IsChargeProtectionEffective()
+                        ? "Manual setting may be overwritten by the next automatic decision."
+                        : "Charge protection is disabled; no automatic decision will overwrite this setting.");
+                ESP_LOGI(TAG, "set_charge_enabled: requested=%d actual=%d",
+                         enabled, actual);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.power.get_charge_state",
+            "Read the current AXP2101 charge-control state. charge_enabled "
+            "and reg_0x18 are a fresh Read of register 0x18 (bit1 = cell "
+            "battery charge enable). charging, discharging, and "
+            "charge_done come from the existing Axp2101 accessors (register "
+            "0x01). battery_level is the fuel-gauge percentage from "
+            "register 0xA4. The response also reports whether automatic "
+            "control is enabled, its inclusive ON/OFF thresholds, and the "
+            "last automatic decision (including threshold-band hold and "
+            "battery-read-failure fail-safe results). Manual charge changes may "
+            "be overwritten by a later automatic decision while auto is "
+            "enabled. Battery voltage/current are intentionally not "
+            "reported because this implementation does not have confirmed "
+            "AXP2101 live-voltage/current ADC readback registers or a "
+            "conversion formula, and this tool intentionally does not add "
+            "a driver for the separate INA226 monitor.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "charge_enabled", pmic_->IsChargeEnabled());
+                cJSON_AddNumberToObject(root, "reg_0x18", pmic_->GetChargeControlRegister());
+                cJSON_AddBoolToObject(root, "charging", pmic_->IsCharging());
+                cJSON_AddBoolToObject(root, "discharging", pmic_->IsDischarging());
+                cJSON_AddBoolToObject(root, "charge_done", pmic_->IsChargingDone());
+                int battery_level = -1;
+                bool battery_level_available =
+                    ReadBatteryLevel(&battery_level);
+                cJSON_AddNumberToObject(root, "battery_level", battery_level);
+                cJSON_AddBoolToObject(root, "battery_level_available",
+                                      battery_level_available);
+                cJSON_AddBoolToObject(root, "auto_enabled",
+                                      IsChargeProtectionEffective());
+                cJSON_AddBoolToObject(
+                    root, "charge_protection",
+                    charge_protection_.load(std::memory_order_acquire));
+                cJSON_AddNumberToObject(
+                    root, "auto_on_below",
+                    charge_on_below_.load(std::memory_order_acquire));
+                cJSON_AddNumberToObject(
+                    root, "auto_off_above",
+                    charge_off_above_.load(std::memory_order_acquire));
+                cJSON_AddNumberToObject(root, "auto_interval_seconds", 60);
+                ChargeAutoDecision last_decision =
+                    last_charge_auto_decision_.load(
+                        std::memory_order_acquire);
+                cJSON_AddStringToObject(
+                    root, "last_auto_decision",
+                    ChargeAutoDecisionName(last_decision));
+                cJSON_AddNumberToObject(
+                    root, "last_auto_battery_level",
+                    last_charge_auto_battery_level_.load(
+                        std::memory_order_relaxed));
+                cJSON_AddBoolToObject(root,
+                                      "manual_may_be_overridden_by_auto",
+                                      IsChargeProtectionEffective());
+                return root;
+            });
+
         ESP_LOGI(TAG, "StackChan MCP tools registered");
     }
 
@@ -7373,6 +8468,7 @@ public:
         InitializeCamera();
         InitializeFt6336TouchPad();
         GetBacklight()->RestoreBrightness();
+        InitializeScreenOffTimer();
         InitializeIOExpander();
         InitializeServo();
         InitializeTouchSettings();
@@ -7409,16 +8505,14 @@ public:
     }
 
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {
-        static bool last_discharging = false;
+        level = -1;
+        bool level_available = ReadBatteryLevel(&level);
+        MaybeApplyAutomaticChargePolicy(level, level_available);
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
-        if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
-            last_discharging = discharging;
-        }
+        ApplyPowerSaveGate(discharging);
 
-        level = pmic_->GetBatteryLevel();
-        return true;
+        return level_available;
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
@@ -7426,6 +8520,11 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveLevel(level);
+    }
+
+    virtual void OnUserActivity() override {
+        power_save_timer_->WakeUp();
+        HandleScreenActivity();
     }
 
     // Phase 4 audio (Issue #76): drive avatar mouth animation alongside TTS

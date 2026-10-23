@@ -1,6 +1,6 @@
 [project]
 name = "stackchan-mcp"
-version = "0.17.0"
+version = "0.20.0"
 description = "Two-faced MCP gateway for StackChan (xiaozhi-esp32): bridges stdio MCP clients to the ESP32 over WebSocket + HTTP."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -75,6 +75,20 @@ tts-voicevox = [
 tts-irodori = [
     "stackchan-mcp[tts]",
     "miniaudio>=1.59",
+]
+# ElevenLabs is a cloud HTTP synthesis service that returns MP3. Same
+# dependency shape as Irodori: the base `[tts]` extra (httpx + opuslib)
+# plus `miniaudio` to decode the MP3 response to PCM.
+tts-elevenlabs = [
+    "stackchan-mcp[tts]",
+    "miniaudio>=1.59",
+]
+# Fish Audio is a hosted HTTP synthesis service. It can return 16-bit mono
+# PCM/WAV at 16 kHz — the device's own rate — so unlike Irodori it needs no
+# decoder and unlike Edge TTS no ffmpeg. This is therefore a no-op alias over
+# `[tts]` (httpx + opuslib), provided so users can declare intent explicitly.
+tts-fish-audio = [
+    "stackchan-mcp[tts]",
 ]
 
 # Phase 4 STT — see Issue #91.

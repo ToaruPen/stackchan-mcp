@@ -21,6 +21,18 @@
 #define WEBSOCKET_PROTOCOL_CAMERA_DATAGRAM_FAILED (1 << 3)
 #define WEBSOCKET_RECONNECT_INITIAL_INTERVAL_MS 5000
 #define WEBSOCKET_RECONNECT_MAX_INTERVAL_MS 60000
+// Keepalive: cadence at which the keepalive timer fires to send an active
+// WebSocket Ping and check connection liveness. The peer's Pong refreshes
+// the liveness signal (see OnPong wiring), so this also sets how often the
+// liveness timestamp is renewed on an idle-but-healthy connection.
+#define WEBSOCKET_KEEPALIVE_INTERVAL_MS 15000
+// Dead-connection threshold: if no frame of any kind (a Pong answering our
+// Ping, or any gateway data frame) has arrived within this many
+// milliseconds, the connection is considered dead and a reconnect is
+// forced. Sized to a small multiple of WEBSOCKET_KEEPALIVE_INTERVAL_MS so
+// several consecutive Pings must go unanswered before tripping — tolerating
+// transient loss without holding a genuinely dead path open too long.
+#define WEBSOCKET_KEEPALIVE_DEAD_TIMEOUT_MS 60000
 
 class WebsocketProtocol : public Protocol {
 public:
@@ -50,6 +62,25 @@ private:
     CameraDatagramToken camera_datagram_token_{};
     size_t camera_datagram_max_bytes_ = kCameraDatagramMaxBytes;
     esp_timer_handle_t reconnect_timer_ = nullptr;
+    // Periodic keepalive timer. Started after a successful WebSocket
+    // handshake, stopped from OnDisconnected and the destructor. Fires
+    // every WEBSOCKET_KEEPALIVE_INTERVAL_MS to (a) actively Ping the
+    // server and (b) check the time since the last received frame
+    // — forcing a reconnect if the path has been silent for longer than
+    // WEBSOCKET_KEEPALIVE_DEAD_TIMEOUT_MS. Without this, a silent
+    // mid-stream network break (e.g. a brief WiFi outage that drops
+    // packets in both directions before any TCP FIN/RST can propagate)
+    // leaves the device in a stuck-connected state with no recovery —
+    // see issue #239.
+    esp_timer_handle_t keepalive_timer_ = nullptr;
+    // Microsecond timestamp of the most recent frame received on the
+    // current WebSocket. Refreshed by OnData (gateway text/binary frames)
+    // and by OnPong (the Pong answering our keepalive Ping) — the latter
+    // is what keeps the signal fresh on an idle-but-healthy connection
+    // with no application traffic. The keepalive timer compares
+    // (now - last_received_us_) against the dead threshold to detect
+    // silent path breaks.
+    std::atomic<uint64_t> last_received_us_{0};
     // True while reconnect_timer_ has a pending one-shot retry. This keeps
     // independent failure/disconnect paths from double-arming the same retry
     // and advancing reconnect_interval_ms_ more than once.
@@ -124,6 +155,9 @@ private:
     void CloseCameraChannel();
     void ScheduleReconnect();
     void StopReconnectTimer();
+    void StartKeepaliveTimer();
+    void StopKeepaliveTimer();
+    void OnKeepaliveTick();
 };
 
 #endif

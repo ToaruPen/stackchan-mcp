@@ -1454,6 +1454,8 @@ async def test_reserved_head_target_never_moves_to_replacement_connection():
 
 
 class _ImmediateHeadLaneConnection:
+    device_id = "test-device"
+    connected_at = None
     connected = True
     initialized = True
 
@@ -1498,7 +1500,7 @@ async def test_replacement_stops_lane_before_switching_reserved_connection():
     assert mgr._head_target_lane_connection is old_connection
     assert mgr._tool_lane_locks["servo"].locked()
 
-    registered = await mgr._register_connection(new_connection)  # type: ignore[arg-type]
+    registered = await mgr._prepare_connection(new_connection)  # type: ignore[arg-type]
 
     assert registered is True
     assert old_connection.connected is False

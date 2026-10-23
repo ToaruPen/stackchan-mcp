@@ -38,7 +38,9 @@ class FakeESP32:
             "device": "fake-stackchan",
         }
 
-    async def call_tool(self, name: str, arguments: dict) -> tuple[dict, None]:
+    async def call_tool(
+        self, name: str, arguments: dict, *, device_id: str | None = None
+    ) -> tuple[dict, None]:
         self.calls.append((name, arguments))
         return {
             "content": [
@@ -539,6 +541,8 @@ async def test_bypass_tools_do_not_enter_dispatcher() -> None:
             "stackchan_follow_pose_stream",
             "stackchan_head_target_lane",
             "stackchan_face_follow",
+            "list_devices",
+            "set_default_device",
         }
     )
     queue = CommandQueue(capacity=2)

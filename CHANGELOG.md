@@ -30,14 +30,285 @@ documented-only.
 
 ## [Unreleased]
 
+### Firmware
+
+- Keep the automatic-sleep setting and external-power policy consistent:
+  enabling automatic sleep on USB still requires the external-power
+  auto-off opt-in before the shutdown timer runs.
+
 ### Gateway
+
+- Preserve default-device camera and face-follow ownership when using the
+  multi-device registry; stop active tracking before switching devices.
 
 - Enable the firmware avatar blink controller after each successful device
   connection while preserving explicit per-connection blink settings.
+- Add `upgrade_firmware(firmware_path)` to flash a local `xiaozhi.bin` over
+  Wi-Fi without USB. Before contacting the device the gateway checks the
+  image (ESP32-S3 app image, project `xiaozhi`, board name, appended
+  SHA-256, fits the OTA slot); it then serves the file once from a random
+  `/firmware/{id}` URL on the capture port that expires after 120 s, calls
+  the device's `self.upgrade_firmware`, waits for the reboot and reconnect,
+  and confirms the running ELF SHA-256. Works with existing firmware
+  (firmware-v1.18.0 tested); no firmware change.
+- Security: bump the locked `cryptography` to 50.0.2 and `setuptools` to
+  83.0.0 (PYSEC-2026-3447). `pip-audit` on the all-extras lock export reports
+  no known vulnerabilities. Re-locking also moves `onnxruntime` for
+  Python 3.10 only from 1.24.3 to 1.23.2 (the STT extra); Python 3.11+ keeps
+  1.26.0. Supersedes #396.
+
+### Tools
+
+- `firmware/scripts/Image_Converter`: Pillow 11.3.0 -> 13.0.0 (security
+  advisories). The converter already uses `Image.Resampling.LANCZOS`.
+
+## [0.20.0] - 2026-10-23
+
+### Gateway
+
+- Expose `set_external_power_auto_off(enabled)` and
+  `get_external_power_auto_off` in `tools/list`, relayed to the device's
+  `self.power.*` tools. Requires firmware-v1.18.0 or later. (#424)
+- Tests only: merge the duplicated `move_head` pitch-rejection tests into one
+  parametrized test (same boundaries and type cases; no runtime change). (#421)
+
+### Compatibility and known limitations
+
+- Recommended pairing: gateway **0.20.0** with firmware **1.18.0**.
+  `set_external_power_auto_off` / `get_external_power_auto_off` need
+  firmware-v1.18.0 or later; everything else in this release works as in
+  gateway 0.19.0.
+
+## [firmware-v1.18.0] - 2026-10-23
+
+### Firmware
+
+- **Behaviour change:** on external power (USB, battery not discharging) the
+  device no longer dims after 60 s idle or powers itself off after 300 s idle.
+  On battery it still does. Previously the idle timer was meant to stop on
+  external power but only reacted to a battery/external *transition*, so a
+  device that booted on USB kept dimming and powering off. The current power
+  source is now applied from the first battery poll after boot and on every
+  change. The idle timer still never counts while the gateway is connected.
+- New persistent opt-in `external_power_auto_off` (NVS namespace `stackchan`,
+  key `ext_auto_off`, **off when unset**) restores the idle dim/power-off on
+  external power too. Applied immediately. New device tools
+  `self.power.set_external_power_auto_off` and
+  `self.power.get_external_power_auto_off`. (#424)
+- Head touch: a TAP or STROKE now needs level H (3) on some channel, whether
+  the screen is on or off. Before, a lit screen also accepted taps that only
+  reached level M, or level L held for 300 ms, and a STROKE needed no
+  particular level. An untouched head produced 17 phantom TAPs in 3.5 minutes
+  on the untagged 2026-10-22 build of firmware-v1.18.0 (L/M bursts on one or
+  all channels, often every ~4 s) and one phantom STROKE from a two-channel M
+  burst; none of them reached H. In the recorded hands-on sessions 40 of 43
+  finger taps and 47 of 49 strokes reached H, so normal and light touches
+  still register; a very light touch that never gets past M no longer does. A
+  press that lights all three zones on its first sample is a TAP only if two
+  of them are at H then: the rarer burst `0x3A` (M, M, H on all zones at once,
+  150 ms) also reached H, while the real taps that started on all zones had
+  two at H. This replaces the level-M / 300 ms TAP rule and the
+  screen-off-only level-H rule described in the head-touch rework below.
+  (#423)
+- Added a persistent, opt-in runtime toggle for the AXP2101 charge protection
+  introduced in firmware-v1.17.0. `charge_protection` is stored in NVS
+  (namespace `stackchan`, key `chg_protect`) and is **off when unset**, so
+  existing devices behave exactly as before. When on, charging is disabled at
+  the upper threshold (70% by default) and resumes at the lower threshold
+  (30% by default); both thresholds are runtime-configurable and persisted
+  (`chg_on_below` / `chg_off_above`). Turning protection off enables the
+  charger immediately so the PMIC can finish a full charge; turning it back
+  on re-evaluates the current battery level at once. New device tools
+  `self.power.set_charge_protection`, `self.power.get_charge_protection`,
+  `self.power.set_charge_thresholds`.
+- Reworked head-touch (Si12T) detection to stop phantom STROKE events on an
+  untouched head (#103) and to catch short taps (#2):
+  - The chip is now soft-reset and configured per the datasheet on every
+    boot (SRST, CH1-3 enabled, baseline reset released, registers read back
+    and logged). Previously the ESP32 reset left whatever baseline the chip
+    already held, and CH2/CH3 were often "pressed" from power-up.
+  - TAP / STROKE are decided by finger movement, not hold time. STROKE means
+    the finger slid from the zone it started on to another zone, or the
+    level-weighted centre of the touched zones moved by one zone or more (a
+    wide, fast finger never fully leaves its start zone); TAP is a
+    100..500 ms press with no movement that reached level M or lasted
+    300 ms or more (a one-tick spike or a lone short level-L blip is dropped).
+    While the screen is off, a press that started asleep must reach level H to
+    count as a TAP and wake the screen: on a still, untouched head the sensor
+    shows short bursts of L/M readings across several channels (measured up to
+    ~18 per minute with the screen off) and none of them reaches H. A hand resting on the head, or a
+    channel stuck "pressed", no longer produces events. A channel that stays
+    non-zero for 15 s has its baseline reset on the chip and is ignored until
+    it reads 0 again. The first 10 s after boot (the chip's fast-calibration
+    window) never produce events. A level-L blip shorter than 300 ms is not a
+    TAP. When charging or the backlight switches, power-rail changes make a
+    single channel flicker for up to ~1 s, so for 1 s a press that starts
+    inside the window can only end as a STROKE (a finger sliding across
+    zones; a stationary press is dropped), a press already on is tracked as
+    usual, and the chip baseline is reset once the window is over (after a
+    finger that is really on the pad lets go).
+  - Polling is now every 50 ms (was 100 ms) and the screen-off timer is only
+    woken by a confirmed TAP/STROKE, so a stuck channel can no longer keep the
+    display on. Face reactions are shorter (TAP 1.2 s, STROKE 1.5 s).
+  - `get_touch_state` also reports `enabled`, `masked`, `recalibrations`, and
+    `boot_grace`. The event sent to the gateway keeps its shape
+    (`touch` / `tap|stroke` / `duration_ms`); a STROKE `duration_ms` is now
+    the length of the press in which the finger moved.
+  - **Behavior change:** head-touch stays **on when `touch/enabled` was never
+    saved**, as before (`set_touch_sensor_enabled(false)` still turns it off and
+    a saved value is kept as is), but with the default settings the robot now
+    reacts differently: the chip is always re-initialised at boot, resting
+    hands and stuck channels no longer count, very short or weak touches are
+    dropped, and while the screen is off only a firm touch (level H) wakes it.
+
+### Compatibility and known limitations
+
+- Recommended pairing: firmware **1.18.0** with gateway **0.20.0**.
+  Firmware 1.18.0 also works with gateways 0.18.0 and 0.19.0, but the
+  charge-protection controls need gateway 0.19.0 or later and the
+  `external_power_auto_off` controls need gateway 0.20.0.
+- On external power the device now stays on when idle; set
+  `external_power_auto_off` to restore the previous dim/power-off.
+- Charge protection stays **off** until enabled; existing devices behave
+  as before. Head-touch keeps its `touch/enabled` setting, but see the
+  behavior change above for how the default settings now react.
+- Existing devices should use the app-only `xiaozhi.bin` update at `0x20000`
+  to preserve NVS/Wi-Fi configuration.
+
+## [0.19.0] - 2026-10-22
+
+### Gateway
+
+- Bump the locked `certifi` to 2026.10.19, which drops the
+  `emSign ECC Root CA - G3` root after the eMudhra intermediate CA key
+  compromise (October 2026).
+- `listen()` honours `STACKCHAN_LISTEN_LANGUAGE` when the tool call
+  omits `language` (still `ja` when unset). The MCP `listen` schema no
+  longer advertises a `language` default, so clients that materialize
+  schema defaults do not override the env.
+- New `fish-audio` TTS engine backed by the hosted
+  [Fish Audio](https://fish.audio) API, selectable per call with
+  `say(voice="fish-audio")` or globally via
+  `STACKCHAN_TTS_ENGINE=fish-audio`. It requests 16-bit mono PCM at the
+  device's own 16 kHz, so unlike Irodori it needs no decoder and unlike
+  Edge TTS no `ffmpeg` — the `tts-fish-audio` extra is a no-op alias over
+  `[tts]`. Configured through `STACKCHAN_FISH_AUDIO_KEY` (required) plus
+  optional `_MODEL`, `_BACKEND`, and `_URL` overrides.
+- The gateway now holds multiple concurrent ESP32 connections keyed by
+  the `Device-Id` header instead of a single connection slot. An optional
+  `device_id` argument on `say`, `listen`, `load_avatar_set`, and every
+  hardware-relay tool selects which unit a call targets, and is declared in
+  each of those tools' published schemas (the follow/beat streaming helpers
+  and `get_status` always act on the default device). Two new tools, `list_devices` and
+  `set_default_device`, list the connected units and change the default
+  target. Callers that omit `device_id` are unaffected: the default target
+  is the first device that connects, as before. Audio recording (`listen`
+  and device-driven capture) is still one gateway-wide slot: while one unit
+  is recording, a `listen` on another unit waits for the slot instead of
+  running in parallel.
+- Expose `set_charge_protection(enabled)`, `get_charge_protection`, and
+  `set_charge_thresholds(on_below, off_above)` in `tools/list` and relay them
+  to the device's `self.power.*` tools. Requires a firmware that includes the
+  persistent charge protection (firmware-v1.18.0).
+
+### Compatibility and known limitations
+
+- Recommended pairing: gateway **0.19.0** with firmware **1.18.0**.
+  The charge-protection tools need firmware 1.18.0 or later; everything else
+  in this release works with firmware 1.17.0.
+- Audio recording (`listen`) is still one gateway-wide slot across devices
+  (see the multi-device entry above).
+
+## [0.18.0] - 2026-10-03
+
+### Gateway
+
+- Isolate mDNS gateway SRV targets and exclude known VM bridges/VPN tunnels while retaining all LAN IPv4 addresses for wildcard HOST (all-address fallback if none remain). (#375)
+- Expose `set_off_timeout(seconds: 0..86400)` and `get_off_timeout` in
+  `tools/list` so MCP clients can discover the existing screen-off controls.
+  The default is 300 seconds; `0` disables screen-off. Requires firmware
+  1.17.0 or later. (#378)
+- Added an ElevenLabs TTS engine (`STACKCHAN_TTS_ENGINE=elevenlabs`)
+  alongside Irodori: official REST API with `eleven_v3` as the default
+  model, per-speaker voice ids via `STACKCHAN_ELEVEN_VOICE_<SPEAKER>`
+  environment variables, and MP3 decoding through the decoder path shared
+  with Irodori. The API key is read from the environment only and is never
+  persisted or logged. (#372)
+- `take_photo` now returns the captured JPEG as an inline `image/jpeg`
+  MCP content block alongside the unchanged text receipt, so LLM clients
+  see the frame directly instead of only a file path. Inlining is limited
+  to JPEGs inside the capture directory and at most 200 KB; any failure
+  degrades to the original text-only receipt. (#373)
 - `get_status` now reports the WebSocket `session_id` alongside the
   connection flags. The id changes on every (re)connection, so a polling
   host can detect a device reboot even when the reconnect lands between
-  polls and `connected` never reads false.
+  polls and `connected` never reads false. (#357)
+- Dispatch `set_off_timeout` / `get_off_timeout` MCP calls through to the
+  device's `self.screen.set_off_timeout` / `self.screen.get_off_timeout`
+  tools, so the new firmware screen-off timeout is reachable over the
+  gateway. (#361)
+
+### Compatibility and known limitations
+
+- Recommended pairing: gateway **0.18.0** with firmware **1.17.0**.
+  Existing tools remain compatible with firmware 1.16.0; the photo image
+  block, ElevenLabs, and `session_id` do not require a firmware update.
+  Screen-off configuration through the gateway requires both new versions.
+- `take_photo` now returns an image block in addition to its text receipt;
+  custom clients that assume text-only results must handle MCP ImageContent.
+  The existing text-only fallback remains available when inlining fails.
+- HTTP TTS timeouts are not a deadline for the entire synthesis (#368);
+  relay-based recording can return empty audio (#350). These remain open
+  limitations, not fixes delivered by this release.
+
+## [firmware-v1.17.0] - 2026-10-03
+
+### Firmware
+
+- Include mDNS gateway discovery in distributed StackChan firmware, which clean release builds previously compiled out. Distributed builds since firmware-v1.9.0 were affected. (#381)
+- Added an active firmware-side WebSocket keepalive that detects silent
+  network breaks and triggers the existing reconnect path. A periodic
+  Ping (every 15 s) probes the connection; the Pong response refreshes
+  a liveness timestamp via `WebSocket::OnPong` (esp-ml307 #49). If no
+  frame arrives within 60 s, the connection is considered dead and a
+  graceful reconnect is forced without a device reboot. (#239, #240)
+- Added a persistent StackChan screen-off timeout (300 seconds by default,
+  `0` to disable) with touch, voice-session (including gateway `say`), avatar,
+  emotion, and MCP wake paths. Activity resets both screen-off and system
+  power-save deadlines. Includes `self.screen.set_off_timeout` /
+  `self.screen.get_off_timeout` controls. (#361)
+- Added opt-in, compile-time configurable AXP2101 charge hysteresis for StackChan. The feature is disabled by default; when enabled, startup first allows charging, protection disables it at 70% or above, and charging resumes at 30% or below. An unreadable fuel gauge fails safe to charging enabled. `self.power.set_charge_enabled` and `self.power.get_charge_state` provide manual control and state inspection. (#360)
+
+### Compatibility and known limitations
+
+- Recommended pairing: firmware **1.17.0** with gateway **0.18.0**.
+  Keepalive and default screen-off also work with gateway 0.17.0;
+  discovering the timeout controls requires gateway 0.18.0.
+- The screen now sleeps and turns its backlight off after **300 seconds**
+  of inactivity by default. Touch, voice, avatar, and MCP activity wake it;
+  `set_off_timeout(seconds=0)` disables it. The timeout is saved in NVS
+  (`display.off_timeout`); older firmware ignores the new key. Screen-off
+  does not disconnect the gateway or put the whole device to sleep.
+- Automatic charge protection is **OFF by default**, enabled only with the
+  compile-time opt-in `STACKCHAN_CHARGE_AUTO=1`. Charging starts enabled;
+  opt-in protection stops it at >=70% and resumes it at <=30%. Manual
+  charge controls are device-side only, absent from the standard gateway's
+  tool list and relay map. The runtime protection toggle in #362 is not included.
+- Transient PMIC I2C errors can still trigger a reboot (#367). Existing
+  servo-hang (#100) and initial-connection (#104) reports are not resolved
+  by this release; verify affected paths on hardware before publishing.
+- Firmware release numbering is independent of the upstream
+  `PROJECT_VER=2.2.6`; the convenience archive remains `v2.2.6_stackchan.zip`.
+  Existing devices should use the app-only `xiaozhi.bin` update at `0x20000`
+  to preserve NVS/Wi-Fi configuration.
+
+### Docs
+
+- Added avatar authoring notes (`docs/avatar-authoring-notes.md`):
+  frame-geometry consistency, full-frame exports from layered sources,
+  the avatar-set fetch window, and blink cadence tuning. (#358)
+- Correct the CoreS3 hardware specification to 8 MB Quad PSRAM in
+  `firmware/AGENTS.md`; firmware configuration is unchanged.
 
 ## [0.17.0] - 2026-07-12
 
@@ -1836,7 +2107,12 @@ uv tool install stackchan-mcp
   alias, so the previous floating pin no longer resolved. ([#47])
 
 
-[Unreleased]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.19.0...v0.20.0
+[firmware-v1.18.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/firmware-v1.17.0...firmware-v1.18.0
+[0.19.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.17.0...v0.18.0
+[firmware-v1.17.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/firmware-v1.16.0...firmware-v1.17.0
 [0.17.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.16.0...v0.17.0
 [firmware-v1.16.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/firmware-v1.15.0...firmware-v1.16.0
 [0.16.0]: https://github.com/kisaragi-mochi/stackchan-mcp/compare/v0.15.0...v0.16.0
